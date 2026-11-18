@@ -118,6 +118,19 @@ The tests run offline with a scripted model and cost no tokens. They include all
 
 The saving comes from asking before doing the work: the plain agent ran the analysis for all 3 definitions. A plain agent with an "ask first" prompt saved just as much. `benchmark.py toy 3` (short task, obvious gaps) showed the harness costing about 2× a plain agent.
 
+## Live comparison with Claude Code (drift task, Sonnet 5.5, 2026-11-18)
+
+Same data, same question, and the same Nigeria direction as a second message. Claude Code ran headless in `--bare` mode (no CLAUDE.md, plugins or MCP servers).
+
+| Run | Cache | Model calls | Cache read | Cache write | Output | Cost |
+|---|---|---|---|---|---|---|
+| Claude Code | 5-min | 4 | 12,975 | 13,070 | 3,689 | $0.071 |
+| Harness, before fixes (check-in failed once) | 1-hour | 7 | 62,514 | 14,911 | 5,379 | ≈ $0.120 |
+| Harness, check-in fixed | 1-hour | 6 | 48,068 | 13,652 | 4,728 | $0.107 |
+| Harness, 5-minute cache | 5-min | 6 | 55,585 | 6,252 | 4,850 | $0.070 |
+
+The last run started from a cache an earlier run had left, so step 1 read 7,522 tokens it would otherwise have written. A cold start costs about $0.088. Both agents reached the same ranking. Claude Code caught the Nigeria anomaly and left it out on its own; the harness stopped and asked first. That check-in step is about $0.010 of output. This task had no rerun on either side, so it measures what supervision costs, not what it saves. The saving shows up when a wrong assumption would otherwise be found after the answer (see the benchmark above).
+
 ## Limits
 
 - Steering takes effect at the next model call, not mid-tool. A 2-minute SQL query finishes before your note or `/stop` is read (PRD S7, later).
