@@ -269,6 +269,7 @@ class HarnessState(AgentState):
     budget_limits: NotRequired[dict[str, Any]]  # T6: budgets you raised at a pause, for this run
     thinking_pins: NotRequired[dict[str, Any]]  # T4: thinking settings per model, fixed at first call
     audit: NotRequired[Annotated[list[dict[str, Any]], operator.add]]  # A8: steers, pauses, decisions
+    harness_mode: NotRequired[str]  # "steer" or "quick", so --thread resumes in the mode the thread ran in
 
 
 def audit_entry(step: int | None, kind: str, what: str, **detail: Any) -> dict[str, Any]:
@@ -623,9 +624,11 @@ class SteeringMiddleware(AgentMiddleware):
 
     state_schema = HarnessState
 
-    def __init__(self, inbox: SteerInbox, summary_model: Any = None, budget: Budget | None = None) -> None:
+    def __init__(self, inbox: SteerInbox, summary_model: Any = None, budget: Budget | None = None,
+                 mode: str = "steer") -> None:
         super().__init__()
         self.inbox = inbox
+        self.mode = mode
         self.summary_model = summary_model  # S11: optional cheap model for a one-line recap
         self.budget = budget or Budget()
         self._briefs: dict[int, str] = {}
@@ -677,7 +680,8 @@ class SteeringMiddleware(AgentMiddleware):
             self.inbox.take_interrupts(step - 1)
             raise StopRun(f"stopped before step {step}")
 
-        paused, caveat, update, log = False, None, {}, []
+        paused, caveat, log = False, None, []
+        update = {} if state.get("harness_mode") == self.mode else {"harness_mode": self.mode}  # for --thread resume
         if isinstance(msgs[-1], ToolMessage):  # a tool step just finished
             s = step_summary(state)
             limits = self._limits(state)
@@ -704,6 +708,7 @@ class SteeringMiddleware(AgentMiddleware):
                         "messages": [AIMessage("Stopped at your request.", additional_kwargs={"harness": "stopped"})],
                         "jump_to": "end",
                         "audit": log + steer_audit(self.inbox, state),
+                        **update,
                     }
                 if action == "caveat":
                     caveat = reply["text"]
@@ -971,6 +976,16 @@ Rules for working:
 - When you finish, state any remaining caveats plainly."""
 
 
+QUICK_PROMPT = """You are an analysis agent. Plan briefly, then do the task end to end without stopping
+to ask, unless you are truly blocked.
+- Messages tagged "[Note from the user, sent while you were working]" arrive mid-run. They
+  override your plan. Acknowledge them in one line and adapt.
+- When you finish, list every assumption you made (definitions, scope, how you handled gaps)
+  and any caveats, so the user can spot one that is wrong."""
+
+MODES_AVAILABLE = ("quick", "steer")
+
+
 ANTHROPIC_API = "https://api.anthropic.com"
 
 
@@ -1010,8 +1025,16 @@ def build_agent(
     budget: Budget | None = None,
     cache_ttl: Literal["5m", "1h"] = "5m",
     middleware: Sequence[AgentMiddleware] = (),
+    mode: Literal["steer", "quick"] = "steer",
 ):
-    """`inbox.pause_every` turns on pause-every-N-steps mode (S13).
+    """`mode="steer"` is the full harness: the ledger first, check-ins at gaps,
+    self-review every `review_every` tool calls. Use it for long analysis that is
+    unlikely to be right in one shot. `mode="quick"` drops those (no ledger, no
+    check_in tool, no self-review) and just runs, but keeps everything that costs
+    nothing unless used: the live step panels, steering, /stop, budgets, the
+    meter and the audit log.
+
+    `inbox.pause_every` turns on pause-every-N-steps mode (S13).
 
     `checkpointer` defaults to SQLite under .harness/. Pass InMemorySaver() for
     throwaway runs. `guard` sets the ledger rule and approval thresholds.
@@ -1021,16 +1044,18 @@ def build_agent(
     """
     model = resolve_model(model)
     inbox = inbox if inbox is not None else SteerInbox()
+    steer = mode == "steer"
+    guard = guard or ToolGuardMiddleware(require_ledger=steer, budget_tokens=budget.run if budget else None)
     return create_deep_agent(
         model=model,
-        tools=[check_in, write_ledger, update_ledger, *tools],
-        system_prompt=SYSTEM_PROMPT,
+        tools=[check_in, write_ledger, update_ledger, *tools] if steer else list(tools),
+        system_prompt=SYSTEM_PROMPT if steer else QUICK_PROMPT,
         middleware=[
             *middleware,
             TodoListMiddleware(),  # write_todos; deepagents 0.7 no longer adds it, and the live view shows the plan
-            SteeringMiddleware(inbox, summary_model=resolve_model(summary_model), budget=budget),
-            guard or ToolGuardMiddleware(budget_tokens=budget.run if budget else None),
-            SelfReviewMiddleware(review_every),
+            SteeringMiddleware(inbox, summary_model=resolve_model(summary_model), budget=budget, mode=mode),
+            guard,
+            *([SelfReviewMiddleware(review_every)] if steer else []),
             ThinkingPinMiddleware(),
             CacheUsageMiddleware(cache_ttl),
             # Same name as deepagents' own, so it replaces it in place: breakpoints after
@@ -1206,12 +1231,17 @@ def _print_approval(payload: dict[str, Any]) -> None:
     print("[Enter] approve · or type why not / what to do instead:")
 
 
-def run_terminal(agent: Any, inbox: SteerInbox, thread_id: str | None = None) -> None:
+def run_terminal(agent: Any, inbox: SteerInbox, thread_id: str | None = None,
+                 make_agent: Any = None, mode: str = "steer") -> None:
     """Chat loop. While the agent runs, every line you type goes to the inbox.
 
     When the agent pauses (ledger, check-in, approval, step pause, or after
     /stop), the next line you type is your answer. Pass `thread_id` to pick up
     a run from an earlier session, including one that was paused.
+
+    With `make_agent(mode)`, `/mode steer` or `/mode quick` at the prompt switches
+    mode. The tools and instructions differ by mode, so a switch starts a new
+    thread rather than breaking the cached prompt of the current one.
     """
     view = LiveView()
     inbox.on_change = view.steer
@@ -1219,6 +1249,7 @@ def run_terminal(agent: Any, inbox: SteerInbox, thread_id: str | None = None) ->
     waiting = threading.Event()
     thread_id = thread_id or str(uuid.uuid4())
     config = {"configurable": {"thread_id": thread_id}, "callbacks": [StopOnRequest(inbox)]}
+    current = {"mode": mode}
 
     def show_ledger() -> None:
         values = agent.get_state(config).values
@@ -1239,6 +1270,8 @@ def run_terminal(agent: Any, inbox: SteerInbox, thread_id: str | None = None) ->
             elif cmd == "/pause":
                 inbox.put(line)
                 print(f"\n   pause mode: {'every ' + str(inbox.pause_every) + ' steps' if inbox.pause_every else 'off'}")
+            elif cmd == "/ledger" and current["mode"] == "quick":
+                print("\n   quick mode has no ledger. Type the change as a normal note, or /mode steer for the next task.")
             elif cmd == "/ledger" and not rest:
                 show_ledger()
             elif cmd == "/ledger" and rest.partition(":")[0].strip() not in LEDGER_FIELDS:
@@ -1281,12 +1314,30 @@ def run_terminal(agent: Any, inbox: SteerInbox, thread_id: str | None = None) ->
             reply = opts[int(reply) - 1]
         return Command(resume=reply)  # resume from the saved checkpoint
 
+    def switch(new_mode: str, new_thread: bool) -> None:
+        nonlocal agent, thread_id, config
+        agent = make_agent(new_mode)
+        current["mode"] = new_mode
+        if new_thread:
+            thread_id = str(uuid.uuid4())
+            config = {"configurable": {"thread_id": thread_id}, "callbacks": [StopOnRequest(inbox)]}
+
+    def banner() -> None:
+        what = ("ledger first, check-ins at gaps, self-review" if current["mode"] == "steer"
+                else "runs straight through; you can still steer, /stop and see each step")
+        print(f"mode: {current['mode']} ({what})  · /mode steer|quick switches before the next question")
+        print(f"thread {thread_id}  (resume later: python steerable.py --thread {thread_id})")
+
     threading.Thread(target=read_stdin, daemon=True).start()
-    print(f"thread {thread_id}  (resume later: python steerable.py --thread {thread_id})")
+    snapshot = agent.get_state(config)
+    ran_in = snapshot.values.get("harness_mode") if snapshot.values else None
+    if make_agent and ran_in and ran_in != current["mode"]:  # resume a thread in the mode it ran in
+        switch(ran_in, new_thread=False)
+        snapshot = agent.get_state(config)
+    banner()
     print(f"Ask a question. While it runs:\n{HINT.strip()}")
 
     turns: list[str] = []
-    snapshot = agent.get_state(config)
     payload: Any = None
     if snapshot.interrupts:  # A7: a run paused in an earlier session picks up here
         print(f"\nThis thread was paused at step {steps_done(snapshot.values['messages'])}. Resuming.")
@@ -1300,6 +1351,14 @@ def run_terminal(agent: Any, inbox: SteerInbox, thread_id: str | None = None) ->
                 question = ask("\nyou> ")
                 if question.strip() in {"exit", "quit"}:
                     return
+                cmd, _, rest = question.strip().partition(" ")
+                if cmd == "/mode":
+                    if not make_agent or rest.strip() not in MODES_AVAILABLE:
+                        print(f"   usage: /mode steer|quick   (now: {current['mode']})")
+                    elif rest.strip() != current["mode"]:
+                        switch(rest.strip(), new_thread=True)
+                        banner()
+                    continue
             payload = {"messages": [HumanMessage(content=question)]}
         while True:  # one turn = possibly several pause/resume cycles
             outcome, pending = stream_run(agent, payload, config, inbox, view)
@@ -1343,4 +1402,10 @@ if __name__ == "__main__":
     budget = Budget(run=env.get("RUN_BUDGET"), step=env.get("STEP_BUDGET"))
     thread = sys.argv[sys.argv.index("--thread") + 1] if "--thread" in sys.argv else None
     ttl = os.environ.get("CACHE_TTL", "5m")  # 1h if you expect to step away mid-run
-    run_terminal(build_agent(model, TOOLS, box, review_every=4, budget=budget, cache_ttl=ttl), box, thread_id=thread)
+    # quick by default; --steer (or HARNESS_MODE=steer) for long analysis that won't be right in one shot
+    mode = "steer" if "--steer" in sys.argv else os.environ.get("HARNESS_MODE", "quick")
+
+    def make(m: str):
+        return build_agent(model, TOOLS, box, review_every=4, budget=budget, cache_ttl=ttl, mode=m)
+
+    run_terminal(make(mode), box, thread_id=thread, make_agent=make, mode=mode)

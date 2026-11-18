@@ -8,6 +8,7 @@ from langchain_core.outputs import ChatGenerationChunk
 
 SEEN: list[list] = []  # what the model received on each call
 BOUND: list[dict] = []  # the settings each call was bound with (thinking, cache_control, ...)
+TOOLS_SEEN: list[list] = []  # the tool names each call was given
 
 
 def used(msg, input=0, cache_read=0, cache_write=0, output=0, model="claude-sonnet-5-5"):
@@ -29,6 +30,7 @@ class ScriptedModel(FakeMessagesListChatModel):
 
     def bind_tools(self, tools, **kwargs):
         BOUND.append({k: v for k, v in kwargs.items() if k != "tool_choice"})
+        TOOLS_SEEN.append([getattr(t, "name", None) or t.get("name") for t in tools])
         return self
 
     def _generate(self, messages, stop=None, run_manager=None, **kwargs):

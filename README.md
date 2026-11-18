@@ -4,6 +4,28 @@
 
 A standard agent turn runs blind from question to answer. If it finds a gap halfway through, such as a missing month or a NULL column, it assumes something and keeps going. You only see the assumption at the end, after paying for all the tokens built on top of it.
 
+## Two modes
+
+| | `quick` (default) | `steer` |
+|---|---|---|
+| Use it for | Questions likely to be right in one go | Long analysis that probably won't be right in one shot |
+| Ledger of assumptions before any tool | no | yes, you confirm it |
+| `check_in` at gaps, self-review every 4 tool calls | no | yes |
+| Live step panels, typing to steer, `/stop`, budgets, meter, audit log | yes | yes |
+| Instructions | Run end to end, then list every assumption made | Ask instead of assuming |
+
+```bash
+python steerable.py
+```
+
+```bash
+python steerable.py --steer
+```
+
+`/mode steer` or `/mode quick` at the `you>` prompt switches before the next question. The two modes give the model different tools and instructions, so a switch starts a new thread instead of breaking the cached prompt of the current one. `--thread <id>` resumes a thread in the mode it ran in. In code: `build_agent(..., mode="quick")`; the default there is `"steer"`.
+
+On the drift task, the steer-mode extras (the ledger turn and the check-in) were about $0.01 to $0.02 of a $0.07 to $0.09 run.
+
 ## What this adds (PRD Phase 1: live view and steering)
 
 | Piece | PRD | What happens |
@@ -69,7 +91,7 @@ uv venv && uv pip install deepagents langchain-anthropic langgraph-checkpoint-sq
 ```
 
 ```bash
-python test_steerable.py && python test_ledger.py && python test_meter.py && python test_audit.py
+python test_steerable.py && python test_ledger.py && python test_meter.py && python test_audit.py && python test_modes.py
 ```
 
 ```bash
