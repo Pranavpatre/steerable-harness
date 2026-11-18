@@ -42,6 +42,14 @@ middleware on top of Deep Agents, built on LangGraph checkpointers + threads.
    step budgets warn at 80% and pause at 100%. Prompt caching uses the 5-minute
    lifetime (1-hour with CACHE_TTL=1h), history is only appended to, and
    thinking settings are pinned.
+
+7. Model router (Phase 4, R1 to R10, T9). ModelRouterMiddleware gives the run
+   three tiers: the main model, a cheaper `cheap` model, and OpenRouter `:free`
+   models as a last resort. A rate-limit, credit or overload error moves the run
+   down a tier for the rest of that task; so does spending `switch_at` of the
+   run budget. With `routine_tools`, a step that only listed or read files goes
+   to the cheap model. The live view says once when the model changes, every
+   step panel names the model, and a free model must ask before it writes.
 """
 
 from __future__ import annotations
@@ -53,6 +61,7 @@ import queue
 import sqlite3
 import sys
 import threading
+import urllib.request
 import uuid
 from collections import Counter
 from collections.abc import Sequence
@@ -63,10 +72,12 @@ from pathlib import Path
 from typing import Annotated, Any, Literal, NotRequired
 
 from langchain.agents.middleware import AgentMiddleware, AgentState, TodoListMiddleware, hook_config
-from langchain.agents.middleware.types import ExtendedModelResponse
+from langchain.agents.middleware.model_fallback import _sanitize_request_for_fallback
+from langchain.agents.middleware.types import ExtendedModelResponse, ModelResponse
 from langchain_anthropic import ChatAnthropic
 from langchain_anthropic.middleware import AnthropicPromptCachingMiddleware
 from langchain_core.callbacks import BaseCallbackHandler
+from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, ToolMessage
 from langchain.tools import ToolRuntime
 from langchain_core.tools import tool
@@ -269,6 +280,7 @@ class HarnessState(AgentState):
     budget_limits: NotRequired[dict[str, Any]]  # T6: budgets you raised at a pause, for this run
     thinking_pins: NotRequired[dict[str, Any]]  # T4: thinking settings per model, fixed at first call
     audit: NotRequired[Annotated[list[dict[str, Any]], operator.add]]  # A8: steers, pauses, decisions
+    route: NotRequired[dict[str, Any]]  # R3, R4: the tier this run moved down to, and why
     harness_mode: NotRequired[str]  # "steer" or "quick", so --thread resumes in the mode the thread ran in
 
 
@@ -407,6 +419,12 @@ def update_ledger(
 # ---------------------------------------------------------------------------
 
 FILE_WRITERS = {"write_file", "edit_file"}
+WRITE_TOOLS = FILE_WRITERS | {"execute"}
+
+
+def writes(tool_name: str) -> bool:
+    """R8: tools that change something, which a free model must ask before calling."""
+    return tool_name in WRITE_TOOLS or any(w in tool_name for w in ("delete", "remove", "drop"))
 
 
 def is_note(m: Any) -> bool:
@@ -438,8 +456,10 @@ def turn_start(messages: list[Any]) -> int:
 
 
 # USD per 1M tokens. A 1-hour cache write bills at 2x input, a 5-minute write at 1.25x.
+# Haiku 5.5 is priced at its card for prompts of 100K tokens or fewer; above that it is 5x.
 PRICES = {
     "claude-sonnet-5-5": {"input": 2.00, "cache_write_5m": 2.50, "cache_write_1h": 4.00, "cache_read": 0.10, "output": 10.00},
+    "claude-haiku-5-5": {"input": 0.10, "cache_write_5m": 0.125, "cache_write_1h": 0.20, "cache_read": 0.01, "output": 0.50},
 }
 TOKEN_KEYS = ("input", "cache_read", "cache_write", "cache_write_1h", "output")
 
@@ -464,10 +484,16 @@ def usage(m: Any) -> dict[str, int]:
     }
 
 
-def token_totals(messages: list[Any]) -> dict[str, int]:
+def is_free(model: str | None) -> bool:
+    """R5: OpenRouter's free models end in `:free`."""
+    return bool(model) and model.endswith(":free")
+
+
+def token_totals(messages: list[Any], paid: bool | None = None) -> dict[str, int]:
+    """Tokens over `messages`. `paid=True` counts only paid models, `paid=False` only free ones."""
     t = dict.fromkeys(TOKEN_KEYS, 0)
     for m in messages:
-        if isinstance(m, AIMessage):
+        if isinstance(m, AIMessage) and (paid is None or paid != is_free(model_of(m))):
             for k, v in usage(m).items():
                 t[k] += v
     return t
@@ -479,10 +505,18 @@ def budgeted(t: dict[str, int]) -> int:
 
 
 def model_of(m: Any) -> str | None:
-    return (getattr(m, "response_metadata", None) or {}).get("model_name")
+    """The model that wrote this reply: the router's tier name if it routed it, else the API's."""
+    meta = getattr(m, "response_metadata", None) or {}
+    return (meta.get("harness_route") or {}).get("model") or meta.get("model_name")
+
+
+def model_name(model: Any) -> str:
+    return getattr(model, "model", None) or getattr(model, "model_name", None) or getattr(model, "name", None) or type(model).__name__
 
 
 def cost(t: dict[str, int], model: str | None) -> float | None:
+    if is_free(model):
+        return 0.0
     p = next((v for k, v in PRICES.items() if model and model.startswith(k)), None)
     if p is None:
         return None
@@ -523,6 +557,7 @@ def step_summary(state: dict[str, Any]) -> dict[str, Any]:
     todos = state.get("todos") or []
     said = ai.text.strip().splitlines()[0][:140] if ai.text.strip() else ""
     run = msgs[turn_start(msgs):]
+    route = ai.response_metadata.get("harness_route") or {}
     return {
         "step": steps_done(msgs),
         "did": ", ".join(f"{n} ×{c}" if c > 1 else n for n, c in calls.items()) or "replied, no tools",
@@ -536,8 +571,10 @@ def step_summary(state: dict[str, Any]) -> dict[str, Any]:
         "plan_now": next((t.get("content") for t in todos if t.get("status") == "in_progress"), None),
         "said": said,
         "model": model_of(ai),
+        "routine": bool(route.get("routine")),
         "step_tokens": usage(ai),
-        "run_tokens": token_totals(run),
+        "run_tokens": token_totals(run, paid=True),  # what the budget counts; free models don't
+        "free_tokens": budgeted(token_totals(run, paid=False)),
         "cost_step": cost(usage(ai), model_of(ai)),
         "cost_run": run_cost(run),
         "ledger_changes": ledger_changes(state.get("ledger_ops") or [], steps_done(msgs)),
@@ -555,7 +592,7 @@ def format_summary(s: dict[str, Any]) -> list[str]:
     st, run = s["step_tokens"], s["run_tokens"]
     head = f"── step {s['step']}"
     if s.get("model"):
-        head += f" · {s['model']}"
+        head += f" · {s['model']}" + (" (routine step)" if s.get("routine") else "")
     if s.get("cost_step") is not None:
         head += f" · ${s['cost_step']:.4f} this step"
     did = f"   did:   {s['did']}"
@@ -569,6 +606,8 @@ def format_summary(s: dict[str, Any]) -> list[str]:
     if s.get("run_limit"):
         meter += f" of {s['run_limit']:,} budget ({used / s['run_limit']:.0%})"
     meter += f", plus {run['cache_read']:,} cache reads"
+    if s.get("free_tokens"):
+        meter += f", plus {s['free_tokens']:,} on free models"
     if s.get("cost_run") is not None:
         meter += f" · ${s['cost_run']:.3f} so far"
     lines = [
@@ -610,6 +649,16 @@ class Budget:
     warn: float = 0.8
 
 
+def run_limits(state: dict[str, Any], budget: Budget) -> dict[str, Any]:
+    """This run's budgets: the defaults, or what you raised them to at a budget pause."""
+    msgs = state["messages"]
+    run_id = msgs[turn_start(msgs)].id
+    saved = state.get("budget_limits") or {}
+    if saved.get("run_id") != run_id:
+        saved = {}
+    return {"run_id": run_id, "run": saved.get("run", budget.run), "step": saved.get("step", budget.step)}
+
+
 class SteeringMiddleware(AgentMiddleware):
     """Runs at every step boundary, before each model call:
 
@@ -634,13 +683,7 @@ class SteeringMiddleware(AgentMiddleware):
         self._briefs: dict[int, str] = {}
 
     def _limits(self, state: dict[str, Any]) -> dict[str, Any]:
-        """This run's budgets: the defaults, or what you raised them to at a budget pause."""
-        msgs = state["messages"]
-        run_id = msgs[turn_start(msgs)].id
-        saved = state.get("budget_limits") or {}
-        if saved.get("run_id") != run_id:
-            saved = {}
-        return {"run_id": run_id, "run": saved.get("run", self.budget.run), "step": saved.get("step", self.budget.step)}
+        return run_limits(state, self.budget)
 
     def _check_budget(self, s: dict[str, Any], limits: dict[str, Any]) -> list[dict[str, Any]]:
         """T6: add 80% warnings to the step panel; return the budgets at 100%."""
@@ -797,6 +840,8 @@ class ToolGuardMiddleware(AgentMiddleware):
 
     def reasons(self, tc: dict[str, Any], msgs: list[Any]) -> list[str]:
         why = []
+        if is_free(model_of(msgs[-1])) and writes(tc["name"]):  # R8
+            why.append(f"a free model ({model_of(msgs[-1])}) wants to write or delete")
         if tc["name"] in self.ask_tools:
             why.append("spawns a subagent" if tc["name"] == "task" else f"{tc['name']} needs approval")
         if len(str(tc["args"])) > self.large_args_chars:
@@ -937,7 +982,7 @@ class ThinkingPinMiddleware(AgentMiddleware):
 
     def wrap_model_call(self, request: Any, handler: Any) -> Any:
         model = request.model
-        name = getattr(model, "model", None) or getattr(model, "model_name", None) or type(model).__name__
+        name = model_name(model)
         now = request.model_settings.get("thinking", getattr(model, "thinking", None))
         pins = request.state.get("thinking_pins") or {}
         if name not in pins:
@@ -953,6 +998,163 @@ class ThinkingPinMiddleware(AgentMiddleware):
                               model=name, asked=json.dumps(now), kept=json.dumps(pins[name]))
             return ExtendedModelResponse(model_response=handler(request), command=Command(update={"audit": [log]}))
         return handler(request)
+
+
+# ---------------------------------------------------------------------------
+# 7. Model router (Phase 4, R1 to R10, T9)
+# ---------------------------------------------------------------------------
+
+OPENROUTER_API = "https://openrouter.ai/api/v1"
+ROUTINE_TOOLS = frozenset({"ls", "read_file", "glob", "grep", "write_todos"})
+
+
+def fallback_reason(e: BaseException) -> str | None:
+    """R3: why an error should move the run down a tier, or None to raise it as is."""
+    status = getattr(e, "status_code", None) or getattr(getattr(e, "response", None), "status_code", None)
+    text = str(e).lower()
+    if status == 429 or "rate limit" in text:
+        return "rate limited"
+    if status == 402 or "credit balance" in text or "insufficient credits" in text:
+        return "out of credits"
+    if status in (503, 529) or "overloaded" in text:
+        return "overloaded"
+    return None
+
+
+def openrouter_tool_models() -> set[str]:
+    """R6: OpenRouter model ids that accept tools (public list, no key needed)."""
+    with urllib.request.urlopen(f"{OPENROUTER_API}/models", timeout=10) as r:
+        data = json.load(r)["data"]
+    return {m["id"] for m in data if "tools" in (m.get("supported_parameters") or [])}
+
+
+def on_openrouter(model: Any) -> bool:
+    return OPENROUTER_API in str(getattr(model, "openai_api_base", None) or "")
+
+
+class ModelRouterMiddleware(AgentMiddleware):
+    """Picks the model for every call. Tier 0 is the agent's own model (Claude),
+    then `cheap`, then each of `free` in order (R2).
+
+    - Hard failure (R3, R10): a rate-limit, credit or overload error moves to the
+      next tier and retries once there. Each tier is tried at most once per call,
+      so a busy free model can't loop. Other errors are raised as they are. When
+      every tier has failed, the run ends with a message instead of retrying.
+    - Budget (R4): once paid tokens reach `switch_at` of the run budget, the run
+      moves to the first free model (or `cheap` if there is none) before the call.
+    - Routine steps (T9): with `routine_tools`, a call whose previous step only
+      used those tools goes to `cheap`. Off by default.
+
+    A switch lasts until the task ends; the next question starts on tier 0 again,
+    which is also how the paid model gets retried once credits return. The live
+    view is told once per switch (R7). This sits outside the prompt-caching
+    middleware, so a non-Anthropic tier gets no cache markers, and markers already
+    in the messages are stripped (R9).
+    """
+
+    state_schema = HarnessState
+
+    def __init__(self, cheap: Any = None, free: Sequence[Any] = (), routine_tools: Sequence[str] = (),
+                 switch_at: float = 0.9, budget: Budget | None = None, check_tools: bool = True,
+                 tool_models: set[str] | None = None) -> None:
+        super().__init__()
+        self.budget = budget
+        self.switch_at = switch_at
+        self.routine_tools = set(routine_tools)
+        self.dropped: list[str] = []
+        tiers = [resolve_model(m) for m in ([cheap] if cheap is not None else []) + list(free)]
+        if check_tools:  # R6
+            tiers = [m for m in tiers if self._supports_tools(m, tool_models)]
+        self.cheap = tiers[0] if cheap is not None and tiers and model_name(tiers[0]) == model_name(resolve_model(cheap)) else None
+        self.chain: list[Any] = [None, *tiers]  # None = the agent's own model
+
+    def _supports_tools(self, model: Any, known: set[str] | None) -> bool:
+        if type(model).bind_tools is BaseChatModel.bind_tools:
+            self.dropped.append(f"{model_name(model)}: this model class has no tool calling")
+            return False
+        if on_openrouter(model):
+            if known is None:
+                try:
+                    known = openrouter_tool_models()
+                except OSError as e:
+                    self.dropped.append(f"(could not check OpenRouter's tool support: {e}; kept {model_name(model)})")
+                    return True
+            if model_name(model) not in known:
+                self.dropped.append(f"{model_name(model)}: OpenRouter lists no tool support")
+                return False
+        return True
+
+    def tiers(self) -> list[str]:
+        return ["the agent's model", *(model_name(m) for m in self.chain[1:])]
+
+    def _first_free(self) -> int:
+        return next((i for i, m in enumerate(self.chain) if m is not None and is_free(model_name(m))),
+                    1 if len(self.chain) > 1 else 0)
+
+    def wrap_model_call(self, request: Any, handler: Any) -> Any:
+        state, msgs = request.state, request.messages
+        run = msgs[turn_start(msgs):] if msgs else []
+        run_id = run[0].id if run else None
+        route = state.get("route") or {}
+        tier = route.get("tier", 0) if route.get("run_id") == run_id else 0
+        start, why = tier, None
+        step = steps_done(msgs) + 1
+
+        if self.budget and self.budget.run and tier == 0 and len(self.chain) > 1:  # R4
+            limit = run_limits(state, self.budget)["run"]
+            used = budgeted(token_totals(run, paid=True))
+            if limit and used >= self.switch_at * limit:
+                tier, why = self._first_free(), f"run budget at {used / limit:.0%} ({used:,} of {limit:,} tokens)"
+
+        use, routine = tier, False
+        last_ai = next((m for m in reversed(msgs) if isinstance(m, AIMessage)), None)
+        if (self.cheap is not None and tier == 0 and self.routine_tools and isinstance(msgs[-1], ToolMessage)
+                and last_ai and last_ai.tool_calls and all(tc["name"] in self.routine_tools for tc in last_ai.tool_calls)):
+            use, routine = 1, True  # T9: this call only, not sticky
+
+        order = list(range(tier, len(self.chain)))  # R10: each tier at most once per call
+        if routine:  # if the cheap model fails on a routine step, Claude takes it before the free tier
+            order = [1] + [i for i in order if i != 1]
+        failures = []
+        for n, use in enumerate(order):
+            model = self.chain[use]
+            req = request
+            if model is not None:
+                req = request.override(model=model)
+                if not isinstance(model, ChatAnthropic):
+                    req = _sanitize_request_for_fallback(req, model)  # R9
+            try:
+                response = handler(req)
+                break
+            except Exception as e:  # noqa: BLE001 - only the classified ones are handled
+                reason = fallback_reason(e)
+                if reason is None:
+                    raise
+                failures.append(f"{model_name(model or request.model)} {reason}")
+                if n + 1 == len(order):  # every tier failed: stop instead of looping
+                    text = ("Stopped: no model could take this step (" + "; ".join(failures) + "). "
+                            "Ask again later, or add credits, and the run starts on the main model again.")
+                    response = AIMessage(text, additional_kwargs={"harness": "stopped"})
+                    log = audit_entry(step, "decision", "models_exhausted", failures=failures)
+                    return ExtendedModelResponse(model_response=ModelResponse(result=[response]),
+                                                 command=Command(update={"audit": [log]}))
+        routine = routine and use == 1
+        if use > tier and not routine:  # a failure moved the run down: it stays there for this task
+            tier, why = use, "; ".join(failures)
+
+        if model is not None:
+            for m in getattr(response, "result", None) or []:
+                if isinstance(m, AIMessage):
+                    m.response_metadata["harness_route"] = {"model": model_name(model), "routine": routine}
+
+        if tier == start:
+            return response
+        old = model_name(self.chain[start] or request.model)
+        new = model_name(self.chain[tier] or request.model)
+        get_stream_writer()({"type": "model_switched", "step": step, "from": old, "to": new, "why": why})  # R7
+        log = audit_entry(step, "decision", "model_switched", **{"from": old, "to": new, "why": why})
+        return ExtendedModelResponse(model_response=response, command=Command(
+            update={"route": {"run_id": run_id, "tier": tier, "model": new, "why": why}, "audit": [log]}))
 
 
 # ---------------------------------------------------------------------------
@@ -1002,6 +1204,18 @@ def resolve_model(model: Any) -> Any:
 
         base_url = os.environ.get("HARNESS_ANTHROPIC_BASE_URL", ANTHROPIC_API)
         return init_chat_model(model, base_url=base_url)
+    if isinstance(model, str) and model.startswith("openrouter:"):  # R1, R5: "openrouter:<model id>"
+        from langchain_openai import ChatOpenAI
+
+        key = os.environ.get("OPENROUTER_API_KEY")
+        if not key:
+            raise ValueError(f"{model} needs OPENROUTER_API_KEY in .env")
+        # one retry at most: failed requests can still count against the free daily allowance (R10)
+        return ChatOpenAI(model=model.split(":", 1)[1], base_url=OPENROUTER_API, api_key=key, max_retries=1)
+    if isinstance(model, str):
+        from langchain.chat_models import init_chat_model
+
+        return init_chat_model(model)
     return model
 
 
@@ -1026,6 +1240,7 @@ def build_agent(
     cache_ttl: Literal["5m", "1h"] = "5m",
     middleware: Sequence[AgentMiddleware] = (),
     mode: Literal["steer", "quick"] = "steer",
+    router: ModelRouterMiddleware | None = None,
 ):
     """`mode="steer"` is the full harness: the ledger first, check-ins at gaps,
     self-review every `review_every` tool calls. Use it for long analysis that is
@@ -1041,11 +1256,14 @@ def build_agent(
     `budget` sets run and step token budgets (T6). `cache_ttl` is the prompt
     cache lifetime (T2): 5 minutes by default. Use "1h" when you expect to pause
     for longer than 5 minutes; its writes cost 2x input against 1.25x. `middleware` runs outermost.
+    `router` adds the cheaper and free tiers (Phase 4); it switches on `budget` unless it has its own.
     """
     model = resolve_model(model)
     inbox = inbox if inbox is not None else SteerInbox()
     steer = mode == "steer"
     guard = guard or ToolGuardMiddleware(require_ledger=steer, budget_tokens=budget.run if budget else None)
+    if router is not None and router.budget is None:
+        router.budget = budget
     return create_deep_agent(
         model=model,
         tools=[check_in, write_ledger, update_ledger, *tools] if steer else list(tools),
@@ -1056,6 +1274,7 @@ def build_agent(
             SteeringMiddleware(inbox, summary_model=resolve_model(summary_model), budget=budget, mode=mode),
             guard,
             *([SelfReviewMiddleware(review_every)] if steer else []),
+            *([router] if router is not None else []),  # outside the caching layers, so they see the routed model
             ThinkingPinMiddleware(),
             CacheUsageMiddleware(cache_ttl),
             # Same name as deepagents' own, so it replaces it in place: breakpoints after
@@ -1158,6 +1377,9 @@ class LiveView:
         if e.get("type") == "step_summary" and e["step"] not in self._shown_steps:
             self._shown_steps.add(e["step"])
             print("\n" + "\n".join(format_summary(e)) + "\n" + HINT)
+        elif e.get("type") == "model_switched":
+            print(f"\n   ⚠ step {e['step']}: switched from {e['from']} to {e['to']} ({e['why']}). "
+                  "It stays there until this task ends.")
         elif e.get("type") == "thinking_pinned":
             print(f"\n   kept {e['model']}'s thinking settings as they were at the start "
                   "(changing them mid-run resets the prompt cache)")
@@ -1405,7 +1627,21 @@ if __name__ == "__main__":
     # quick by default; --steer (or HARNESS_MODE=steer) for long analysis that won't be right in one shot
     mode = "steer" if "--steer" in sys.argv else os.environ.get("HARNESS_MODE", "quick")
 
+    # Phase 4 tiers, e.g. CHEAP_MODEL=anthropic:claude-haiku-5-5
+    # FREE_MODELS=openrouter:<id>:free,openrouter:<id>:free  ROUTINE=1 sends file-listing steps to CHEAP_MODEL
+    cheap = os.environ.get("CHEAP_MODEL") or None
+    free = [m.strip() for m in os.environ.get("FREE_MODELS", "").split(",") if m.strip()]
+    routine = ROUTINE_TOOLS if os.environ.get("ROUTINE") == "1" else ()
+    if cheap or free:
+        probe = ModelRouterMiddleware(cheap, free, routine_tools=routine)  # R6: check tool support once
+        print("models: " + " → ".join([model, *probe.tiers()[1:]]))
+        for d in probe.dropped:
+            print(f"   dropped {d}")
+        cheap = cheap if probe.cheap is not None else None
+        free = [m for m in free if m.split(":", 1)[1] in probe.tiers()]
+
     def make(m: str):
-        return build_agent(model, TOOLS, box, review_every=4, budget=budget, cache_ttl=ttl, mode=m)
+        router = ModelRouterMiddleware(cheap, free, routine_tools=routine, check_tools=False) if cheap or free else None
+        return build_agent(model, TOOLS, box, review_every=4, budget=budget, cache_ttl=ttl, mode=m, router=router)
 
     run_terminal(make(mode), box, thread_id=thread, make_agent=make, mode=mode)

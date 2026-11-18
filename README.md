@@ -84,6 +84,31 @@ Budgets count every token except cache reads, which bill at 1/20 of the input pr
    run:    4,700 tokens of 5,000 budget (94%), plus 3,000 cache reads · $0.013 so far
 ```
 
+## Phase 4: model routing and free fallback
+
+`ModelRouterMiddleware(cheap, free, ...)` gives the run three tiers: the agent's own model (Claude Sonnet 5.5), a cheaper model, then OpenRouter `:free` models in order. Pass it as `build_agent(router=...)`, or set the tiers in the terminal:
+
+```bash
+CHEAP_MODEL=anthropic:claude-haiku-5-5 FREE_MODELS=openrouter:meta-llama/llama-3.3-70b-instruct:free python steerable.py
+```
+
+| Piece | PRD | What happens |
+|---|---|---|
+| Model strings | R1, R5 | Every tier is a string: `anthropic:...`, `openai:...`, or `openrouter:<model id>`. OpenRouter models need `OPENROUTER_API_KEY` in `.env`; nothing runs locally. |
+| Switch on failure | R3, R10 | A 429 rate limit, a credit error (Anthropic's "credit balance is too low", OpenRouter's 402) or a 529 overload moves the run to the next tier, which retries the call. Each tier is tried at most once per call, and OpenRouter clients retry once at most, since failed requests can still count against the free daily allowance. When every tier fails, the run stops with a message rather than looping. Any other error is raised as it is. |
+| Switch on budget | R4 | Once paid tokens reach 90% of the run budget (`switch_at`), the next call goes to the first free model, before anything fails. Free-model tokens don't count against the budget, so the run finishes on the free tier instead of pausing at 100%. They show in the meter as "plus N on free models". |
+| Routine steps | T9 | With `routine_tools` (or `ROUTINE=1`, which uses `ls`, `read_file`, `glob`, `grep`, `write_todos`), a call that follows a step using only those tools goes to the cheap model, for that call only. Off by default. |
+| Tool check | R6 | At startup, models whose class can't call tools, and OpenRouter models whose listing doesn't include `tools`, are dropped, and the terminal prints which and why. |
+| Telling you | R7 | The live view prints one line when the run switches (`⚠ step 3: switched from claude-sonnet-5-5 to ... (out of credits)`), and the audit log records it. Every step panel names the model; a routine step says `(routine step)`. |
+| Free models ask before writing | R8 | On a free model, `write_file`, `edit_file`, `execute` and any tool with delete, remove or drop in its name pause for approval first. |
+| Cache markers | R9 | The router sits outside the caching middleware, so a non-Anthropic tier never gets breakpoints, and LangChain's own fallback sanitizer strips any markers already in the messages. The LangChain issue the PRD mentions is fixed in langchain 1.5: `ModelFallbackMiddleware` strips them too. |
+
+A switch lasts until the task ends. The next question starts on Claude again, so once credits return, the paid model comes back without a probe (PRD R11 would add a mid-task probe; not built).
+
+The PRD suggests LangChain's `ModelFallbackMiddleware` for hard failures. The router does that itself instead, because the stock middleware retries on any error (including bugs), doesn't stay on the fallback for later steps, and doesn't report the switch.
+
+Haiku 5.5 costs $0.10 / $0.50 per million input / output tokens up to 100K-token prompts, against Sonnet 5.5's $2 / $10. A routine step on Haiku has no cache yet, so it pays Haiku's cache-write rate on the whole prompt the first time, but its output is 20x cheaper. Whether routine routing saves money on a given task needs a live run.
+
 ## Run it
 
 ```bash
@@ -91,7 +116,7 @@ uv venv && uv pip install deepagents langchain-anthropic langgraph-checkpoint-sq
 ```
 
 ```bash
-python test_steerable.py && python test_ledger.py && python test_meter.py && python test_audit.py && python test_modes.py
+python test_steerable.py && python test_ledger.py && python test_meter.py && python test_audit.py && python test_modes.py && python test_router.py
 ```
 
 ```bash
@@ -116,7 +141,7 @@ AGENT_MODEL=openai:gpt-5-mini python live_test.py
 
 With a non-Anthropic model, the Anthropic cache breakpoints are skipped (OpenAI caches long prompts on its own), the meter still reads its cache-read tokens, and costs show as `?` until the model is added to `PRICES`.
 
-The tests run offline with a scripted model and cost no tokens. They include all three gates. Phase 1: a steer lands before the next model call and reports the step it landed on. Phase 2: a run pauses at the ledger in one process and is resumed and finished by another, from the SQLite file alone. Phase 3: the meter shows cache reads, and a budget pauses the run at 100%. The cache tests build the exact request a real `ChatAnthropic` would send, without sending it, and check the breakpoints and that each request extends the one before. For the live run, ask "Compare signups by channel Jul to Oct and activation per channel". The toy data has a missing September and a NULL organic activation rate, so the agent should check in.
+The tests run offline with a scripted model and cost no tokens. They include all four gates. Phase 1: a steer lands before the next model call and reports the step it landed on. Phase 2: a run pauses at the ledger in one process and is resumed and finished by another, from the SQLite file alone. Phase 3: the meter shows cache reads, and a budget pauses the run at 100%. Phase 4: when Claude runs out of credits, the run moves down a tier, says so once, and stays there; each tier is tried once, and a model that can't call tools is dropped. The routing tests raise the same errors the APIs return, and build the real OpenRouter request to check it has no cache markers. The cache tests build the exact request a real `ChatAnthropic` would send, without sending it, and check the breakpoints and that each request extends the one before. For the live run, ask "Compare signups by channel Jul to Oct and activation per channel". The toy data has a missing September and a NULL organic activation rate, so the agent should check in.
 
 ## The build, step by step
 
@@ -164,7 +189,11 @@ The last run started from a cache an earlier run had left, so step 1 read 7,522 
 - Cost estimates for approvals are rough: a subagent is priced as 5 model calls at the run's average size so far, any other call by its argument size.
 - Budgets are checked at step boundaries. One very large step can overshoot before the pause, and its tool calls run first. The A5 approval catches calls it can see are large in advance.
 - Tokens a subagent (`task`) spends aren't in the parent's messages, so the meter and budgets don't count them yet.
-- Costs are only shown for models in `PRICES` (Sonnet 5.5 now). Other models show tokens without a cost.
+- Costs are only shown for models in `PRICES` (Sonnet 5.5 and Haiku 5.5) and `:free` models ($0). Other models show tokens without a cost. Haiku is priced at its up-to-100K-token rate; longer prompts cost 5x that.
+- The router has only been tested offline. No OpenRouter key has been used yet, so the free tier, its tool calling and its error messages are unverified on the real service.
+- Free models are weaker. The ledger, check-ins and the R8 approval matter more on them, and whether a given free model calls tools well needs a live run.
+- Subagents (`task`) run on the main model; the router doesn't route their calls.
+- Before sending real data to a free model, check its data policy (PRD open question). Some free providers log prompts.
 - With the default 5-minute cache, a pause longer than 5 minutes means the next call writes the whole prompt to the cache again. On the drift task the 1-hour cache cost about $0.020 more per run, so use it only for sessions where you'll step away.
 - The cache tests check the request bytes, not real cache hits. Hit rates need a live run.
 - `benchmark.py` and `live_test.py` use in-memory checkpoints because they reuse thread IDs.
