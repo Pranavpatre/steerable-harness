@@ -29,14 +29,27 @@ Steering notes and caveats are appended at the end of the message list, never ed
 | One interrupt per node | A6 | Each pause is a single `interrupt()` in its node. Blocked or declined calls get an artificial tool result, and LangGraph's own conditional edge sends the run back to the model. No loops around `interrupt()`. |
 | Survives a restart | A7 | Checkpoints go to SQLite at `.harness/checkpoints.sqlite`. `python steerable.py --thread <id>` picks up a paused run in a new process. |
 
-The ledger is stored as an append-only list of ops (`state["ledger_ops"]`), and the current ledger is folded from it. Parallel tool calls can't overwrite each other, and the list already records who changed what at which step, which is the start of the A8 audit log.
+The ledger is stored as an append-only list of ops (`state["ledger_ops"]`), and the current ledger is folded from it. Parallel tool calls can't overwrite each other.
+
+### Audit log (A8)
+
+Every steer, pause and decision is logged with its step number and time:
+
+| Kind | What gets logged |
+|---|---|
+| steer | each message you send (steer, follow-up, collect, ledger edit, /stop), whether it was delivered or dropped, and the step it landed on |
+| pause | the ledger checkpoint, check-ins, step pauses, budget pauses and approvals, with what was asked and what you answered |
+| decision | calls blocked before the ledger, budget warnings, self-review prompts, and thinking settings put back |
+| ledger | the ledger written, confirmed, corrected, and every change after, by you or the agent |
+
+The log lives in run state, so it is checkpointed with the run and survives a restart. A node that re-runs after a pause doesn't log it twice. `/audit` prints it, and the terminal writes the whole log to `.harness/audit/<thread>.jsonl` at every pause, stop and finished turn. Steps follow one rule: an entry belongs to the model call it is about, so a steer "at step 3" reached the model at its third call.
 
 ## Phase 3: token meter and budgets
 
 | Piece | PRD | What happens |
 |---|---|---|
 | Append-only history | T1 | Steers, caveats, ledger edits and the self-review prompt are all appended at the end and saved. Every request starts with the previous request, byte for byte, so repeated input is billed at the cache-read rate. |
-| 1-hour cache | T2 | Breakpoints after the system prompt, after the tool definitions, and on the latest message, with the 1-hour lifetime, because a supervised run can pause for you longer than the 5-minute cache lasts. This replaces deepagents' own 5-minute caching middleware. `build_agent(cache_ttl="5m")` switches back. |
+| Cache lifetime | T2 | Breakpoints after the system prompt, after the tool definitions, and on the latest message. The default lifetime is 5 minutes, since most pauses are shorter. If you expect to step away mid-run, `CACHE_TTL=1h` in the terminal (or `build_agent(cache_ttl="1h")`) keeps the cache for an hour, at 2x input per write instead of 1.25x. This replaces deepagents' own caching middleware. When a streamed reply doesn't split cache writes by lifetime, the meter records them at the lifetime the harness asked for. |
 | Thinking pinned | T4 | The first call to each model in a thread fixes its thinking settings. If anything asks for different ones mid-run, the original settings are put back and the live view says so. |
 | Budgets | T6 | `Budget(run=..., step=...)`, or `RUN_BUDGET` / `STEP_BUDGET` in the terminal. The step panel warns once the run crosses 80%, or when a step uses 80% of the step budget. At 100% the run pauses at the next step boundary: [1] Continue (adds one more run budget), [2] Set a new budget, [3] Stop, or type a note to continue with. A new question starts a fresh run budget. |
 | Meter | T8 | Every step panel shows that call's input, cache read, cache write and output tokens from the usage fields the API returns, the run total against its budget, and the cost. `/tokens` prints the table for the whole thread, at any prompt. |
@@ -52,11 +65,11 @@ Budgets count every token except cache reads, which bill at 1/20 of the input pr
 ## Run it
 
 ```bash
-uv venv && uv pip install deepagents langchain-anthropic
+uv venv && uv pip install deepagents langchain-anthropic langgraph-checkpoint-sqlite python-dotenv
 ```
 
 ```bash
-python test_steerable.py && python test_ledger.py && python test_meter.py
+python test_steerable.py && python test_ledger.py && python test_meter.py && python test_audit.py
 ```
 
 ```bash
@@ -66,6 +79,20 @@ ANTHROPIC_API_KEY=... python steerable.py
 ```bash
 RUN_BUDGET=50000 STEP_BUDGET=15000 python steerable.py
 ```
+
+```bash
+CACHE_TTL=1h python steerable.py
+```
+
+`HARNESS_TASK=drift` loads the longer drift task instead (8 countries × 4 months, with a planted Nigeria October anomaly). Its data is identical to `../cc-compare/toydb.py`, the command-line version used for the Claude Code comparison.
+
+Any LangChain provider works through `AGENT_MODEL`. For OpenAI, put `OPENAI_API_KEY` in `.env` and install `langchain-openai`:
+
+```bash
+AGENT_MODEL=openai:gpt-5-mini python live_test.py
+```
+
+With a non-Anthropic model, the Anthropic cache breakpoints are skipped (OpenAI caches long prompts on its own), the meter still reads its cache-read tokens, and costs show as `?` until the model is added to `PRICES`.
 
 The tests run offline with a scripted model and cost no tokens. They include all three gates. Phase 1: a steer lands before the next model call and reports the step it landed on. Phase 2: a run pauses at the ledger in one process and is resumed and finished by another, from the SQLite file alone. Phase 3: the meter shows cache reads, and a budget pauses the run at 100%. The cache tests build the exact request a real `ChatAnthropic` would send, without sending it, and check the breakpoints and that each request extends the one before. For the live run, ask "Compare signups by channel Jul to Oct and activation per channel". The toy data has a missing September and a NULL organic activation rate, so the agent should check in.
 
@@ -103,7 +130,7 @@ The saving comes from asking before doing the work: the plain agent ran the anal
 - Budgets are checked at step boundaries. One very large step can overshoot before the pause, and its tool calls run first. The A5 approval catches calls it can see are large in advance.
 - Tokens a subagent (`task`) spends aren't in the parent's messages, so the meter and budgets don't count them yet.
 - Costs are only shown for models in `PRICES` (Sonnet 5.5 now). Other models show tokens without a cost.
-- A 1-hour cache write costs 2x input against 1.25x for 5 minutes. It pays off when you pause for more than 5 minutes and the prefix would otherwise be written again.
+- With the default 5-minute cache, a pause longer than 5 minutes means the next call writes the whole prompt to the cache again. On the drift task the 1-hour cache cost about $0.020 more per run, so use it only for sessions where you'll step away.
 - The cache tests check the request bytes, not real cache hits. Hit rates need a live run.
 - `benchmark.py` and `live_test.py` use in-memory checkpoints because they reuse thread IDs.
 - Anthropic models always call `https://api.anthropic.com`, even if your shell has `ANTHROPIC_BASE_URL` set (the Claude desktop app sets one). To use a proxy on purpose, set `HARNESS_ANTHROPIC_BASE_URL`.

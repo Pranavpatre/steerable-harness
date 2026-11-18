@@ -18,7 +18,8 @@ from pydantic import Field
 
 from example_tools import TOOLS
 from scripted_model import BOUND, ScriptedModel, call, used
-from steerable import Budget, SteerInbox, ToolGuardMiddleware, build_agent, format_summary, token_table
+from steerable import (Budget, SteerInbox, ToolGuardMiddleware, build_agent, format_summary, run_cost,
+                       token_table, token_totals)
 
 
 def build(model, inbox=None, **kw):
@@ -149,13 +150,14 @@ def flat(payload):
 
 
 model = CaptureAnthropic(model="claude-sonnet-5-5", api_key="offline", disable_streaming=True, replies=[
-    call("query_signups", {"month": "2026-07"}, 1),
-    call("query_signups", {"month": "2026-08"}, 2),
-    call("query_signups", {"month": "2026-10"}, 3),
-    AIMessage("Done."),
+    # usage as a streamed reply reports it: a cache-write total with no 5-minute / 1-hour split
+    used(call("query_signups", {"month": "2026-07"}, 1), input=10, cache_write=7000, output=50),
+    used(call("query_signups", {"month": "2026-08"}, 2), input=5, cache_read=7000, cache_write=400, output=50),
+    used(call("query_signups", {"month": "2026-10"}, 3), input=5, cache_read=7400, cache_write=300, output=50),
+    used(AIMessage("Done."), input=5, cache_read=7700, output=20),
 ])
 inbox = SteerInbox()
-agent = build(model, inbox, review_every=2)
+agent = build(model, inbox, review_every=2, cache_ttl="1h")
 cfg = {"configurable": {"thread_id": "cache"}}
 for chunk in agent.stream({"messages": [HumanMessage("trend?")]}, cfg, stream_mode="updates"):
     if "tools" in chunk and not inbox.items:
@@ -176,5 +178,23 @@ for a, b in zip(P, P[1:]):
     assert flat(b)[:len(flat(a))] == flat(a), "each request must start with the previous one, byte for byte"
 assert any("referral only" in x for x in flat(P[1])) and any("Self-review" in x for x in flat(P[2]))
 print("PASS with a steer and a self-review prompt mid-run, every request extends the previous one, so the cache prefix holds")
+
+t = token_totals(agent.get_state(cfg).values["messages"])
+assert t["cache_write"] == t["cache_write_1h"] == 7700, t
+assert abs(run_cost(agent.get_state(cfg).values["messages"]) - (25 * 2 + 22100 * 0.1 + 7700 * 4 + 170 * 10) / 1e6) < 1e-9
+print("PASS cache writes with no lifetime split are counted as 1-hour writes and priced at $4 per million, not $2.50")
+
+import inspect
+
+assert inspect.signature(build_agent).parameters["cache_ttl"].default == "5m"
+model = CaptureAnthropic(model="claude-sonnet-5-5", api_key="offline", disable_streaming=True,
+                         replies=[used(AIMessage("hi"), input=5, cache_write=6000, output=3)])
+agent = build(model)
+cfg = {"configurable": {"thread_id": "default-ttl"}}
+agent.invoke({"messages": [HumanMessage("hi")]}, cfg)
+assert model.payloads[0]["cache_control"] == {"type": "ephemeral", "ttl": "5m"}
+t = token_totals(agent.get_state(cfg).values["messages"])
+assert t["cache_write"] == 6000 and t["cache_write_1h"] == 0, "default writes are 5-minute and priced at $2.50"
+print("PASS the default cache is 5 minutes; CACHE_TTL=1h / cache_ttl='1h' opts into the 1-hour cache")
 
 print("ALL-METER-TESTS-OK")

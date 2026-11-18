@@ -199,3 +199,24 @@ assert mw.due(h + [AIMessage("")] + tools(3) + [AIMessage("")] + tools(2)), "3 -
 assert not mw.due(h + [AIMessage("")] + tools(5) + [AIMessage("")] + tools(1)), "5 -> 6 does not"
 assert mw.due(h + [AIMessage("")] + tools(8)), "0 -> 8 in one batch"
 print("PASS self-review catches parallel batches that skip past a multiple")
+
+# --- check_in accepts one string for gaps (seen live: a model sent a string, the call failed) ---
+
+agent = build_agent(ScriptedModel(responses=[
+    call("check_in", {"progress_so_far": "8 countries pulled", "gaps_or_concerns": "NG Oct looks fake",
+                      "proposed_next_step": "exclude NG Oct"}, 1),
+    AIMessage("ok"),
+]), TOOLS, SteerInbox())
+cfg = {"configurable": {"thread_id": "t-str"}}
+_, p = run(agent, {"messages": [HumanMessage("rank")]}, cfg)
+assert p and p["type"] == "check_in" and p["gaps_or_concerns"] == ["NG Oct looks fake"], p
+print("PASS a check_in with gaps as one string pauses normally instead of failing")
+
+agent = build_agent(ScriptedModel(responses=[
+    call("check_in", {"progress_so_far": "x", "gaps_or_concerns": '["NG Oct looks fake", "Aug and Sep not pulled"]',
+                      "proposed_next_step": "y"}, 1),
+    AIMessage("ok"),
+]), TOOLS, SteerInbox())
+_, p = run(agent, {"messages": [HumanMessage("rank")]}, {"configurable": {"thread_id": "t-json"}})
+assert p["gaps_or_concerns"] == ["NG Oct looks fake", "Aug and Sep not pulled"], p
+print("PASS a check_in with gaps as a JSON list in a string is split back into separate gaps")

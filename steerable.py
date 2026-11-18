@@ -39,8 +39,9 @@ middleware on top of Deep Agents, built on LangGraph checkpointers + threads.
 6. Token meter and budgets (Phase 3, T1, T2, T4, T6, T8). Every step panel
    shows that call's input, cache read, cache write and output tokens from the
    API's usage fields, and `/tokens` prints the table for the thread. Run and
-   step budgets warn at 80% and pause at 100%. Prompt caching uses the 1-hour
-   lifetime, history is only appended to, and thinking settings are pinned.
+   step budgets warn at 80% and pause at 100%. Prompt caching uses the 5-minute
+   lifetime (1-hour with CACHE_TTL=1h), history is only appended to, and
+   thinking settings are pinned.
 """
 
 from __future__ import annotations
@@ -55,12 +56,15 @@ import threading
 import uuid
 from collections import Counter
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+import json
 from pathlib import Path
 from typing import Annotated, Any, Literal, NotRequired
 
 from langchain.agents.middleware import AgentMiddleware, AgentState, TodoListMiddleware, hook_config
 from langchain.agents.middleware.types import ExtendedModelResponse
+from langchain_anthropic import ChatAnthropic
 from langchain_anthropic.middleware import AnthropicPromptCachingMiddleware
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, ToolMessage
@@ -83,10 +87,11 @@ STOP = "/stop"
 @tool
 def check_in(
     progress_so_far: str,
-    gaps_or_concerns: list[str],
+    gaps_or_concerns: list[str] | str,
     proposed_next_step: str,
+    runtime: ToolRuntime,
     options: list[str] | None = None,
-) -> str:
+) -> Command:
     """Pause the run and show the user where you are before continuing.
 
     Call this INSTEAD of assuming whenever:
@@ -98,10 +103,16 @@ def check_in(
 
     Args:
         progress_so_far: What you have done and found so far, with numbers.
-        gaps_or_concerns: Each missing data point or doubt, one per item.
+        gaps_or_concerns: Each missing data point or doubt, one per item (a list of strings).
         proposed_next_step: What you will do next if the user just says "go".
         options: Optional 2-4 concrete alternatives the user can pick from.
     """
+    if isinstance(gaps_or_concerns, str):  # models sometimes send one string, or a JSON list as text
+        try:
+            parsed = json.loads(gaps_or_concerns)
+        except ValueError:
+            parsed = None
+        gaps_or_concerns = [str(g) for g in parsed] if isinstance(parsed, list) else [gaps_or_concerns]
     reply = interrupt(
         {
             "type": "check_in",
@@ -111,12 +122,15 @@ def check_in(
             "options": options or [],
         }
     )
-    return (
+    text = (
         f"The user replied: {reply!r}\n"
         "Treat this as authoritative. If it changes the plan, follow the new plan. "
         "If it supplies missing data or a definition, use exactly that. "
         "If it says go / continue / ok, proceed with your proposed next step."
     )
+    log = audit_entry(steps_done(runtime.state["messages"]), "pause", "check_in",
+                      gaps=gaps_or_concerns, proposed=proposed_next_step, answer=str(reply))
+    return Command(update={"audit": [log], "messages": [ToolMessage(text, tool_call_id=runtime.tool_call_id)]})
 
 
 # ---------------------------------------------------------------------------
@@ -137,6 +151,7 @@ class Steer:
     text: str
     status: str = "queued"  # queued | delivered | dropped
     step: int | None = None  # the step it was delivered at
+    uid: str = field(default_factory=lambda: uuid.uuid4().hex[:8])  # stable key for the audit log
 
     def label(self) -> str:
         where = f" at step {self.step}" if self.step is not None else ""
@@ -253,6 +268,31 @@ class HarnessState(AgentState):
     ledger_ops: NotRequired[Annotated[list[dict[str, Any]], operator.add]]
     budget_limits: NotRequired[dict[str, Any]]  # T6: budgets you raised at a pause, for this run
     thinking_pins: NotRequired[dict[str, Any]]  # T4: thinking settings per model, fixed at first call
+    audit: NotRequired[Annotated[list[dict[str, Any]], operator.add]]  # A8: steers, pauses, decisions
+
+
+def audit_entry(step: int | None, kind: str, what: str, **detail: Any) -> dict[str, Any]:
+    """A8: one audit record. kind is steer, pause, decision or ledger.
+
+    Entries live in run state, so they are checkpointed with the run, survive a
+    restart, and a node that re-runs after a pause doesn't write them twice.
+    """
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    return {"step": step, "kind": kind, "what": what, "at": now, **{k: v for k, v in detail.items() if v not in (None, "", [])}}
+
+
+def ledger_audit(ops: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    written = [audit_entry(ops[0]["step"], "ledger", "written", by="agent")] if any(o["op"] == "set" for o in ops) else []
+    return written + [audit_entry(o.get("step"), "ledger", o["op"], by=o.get("by"),
+                                  change=format_op(o) if "field" in o or o["op"] == "edit" else None)
+                      for o in ops if o["op"] != "set"]
+
+
+def steer_audit(inbox: Any, state: dict[str, Any]) -> list[dict[str, Any]]:
+    """Steers that were delivered or dropped and aren't in the log yet."""
+    have = {e.get("uid") for e in state.get("audit") or []}
+    return [audit_entry(s.step, "steer", s.mode, status=s.status, text=s.text, uid=s.uid)
+            for s in list(inbox.items) if s.status != "queued" and s.uid not in have]
 
 
 def current_ledger(ops: list[dict[str, Any]]) -> tuple[dict[str, list[str]], bool]:
@@ -330,7 +370,8 @@ def write_ledger(
             f"The user corrected the ledger: {reply!r}\n"
             "Treat this as authoritative. Call update_ledger to record each change, then continue."
         )
-    return Command(update={"ledger_ops": ops, "messages": [ToolMessage(text, tool_call_id=runtime.tool_call_id)]})
+    log = [*ledger_audit(ops), audit_entry(step, "pause", "ledger", answer=reply or "confirmed")]
+    return Command(update={"ledger_ops": ops, "audit": log, "messages": [ToolMessage(text, tool_call_id=runtime.tool_call_id)]})
 
 
 @tool
@@ -356,7 +397,8 @@ def update_ledger(
         return Command(update={"messages": [ToolMessage("revised needs new_item.", tool_call_id=runtime.tool_call_id, status="error")]})
     op = {"op": change, "field": field, "item": item, "new_item": new_item, "reason": reason,
           "by": "agent", "step": steps_done(runtime.state["messages"])}
-    return Command(update={"ledger_ops": [op], "messages": [ToolMessage(f"Ledger: {format_op(op)}", tool_call_id=runtime.tool_call_id)]})
+    return Command(update={"ledger_ops": [op], "audit": ledger_audit([op]),
+                           "messages": [ToolMessage(f"Ledger: {format_op(op)}", tool_call_id=runtime.tool_call_id)]})
 
 
 # ---------------------------------------------------------------------------
@@ -635,11 +677,12 @@ class SteeringMiddleware(AgentMiddleware):
             self.inbox.take_interrupts(step - 1)
             raise StopRun(f"stopped before step {step}")
 
-        paused, caveat, update = False, None, {}
+        paused, caveat, update, log = False, None, {}, []
         if isinstance(msgs[-1], ToolMessage):  # a tool step just finished
             s = step_summary(state)
             limits = self._limits(state)
             over = self._check_budget(s, limits)
+            log += [audit_entry(s["step"], "decision", "budget_warning", detail=w) for w in s["warnings"]]
             s["brief"] = self._brief(s, state)
             get_stream_writer()({"type": "step_summary", **s})
             every = self.inbox.pause_every
@@ -652,10 +695,15 @@ class SteeringMiddleware(AgentMiddleware):
             if reply is not None:
                 paused = True
                 action = reply.get("action") if isinstance(reply, dict) else "continue"
+                log.append(audit_entry(s["step"], "pause", "budget" if over else "step_pause", answer=action,
+                                       text=reply.get("text") if isinstance(reply, dict) else None,
+                                       tokens=reply.get("tokens") if isinstance(reply, dict) else None,
+                                       over=[f"{o['kind']} {o['used']:,}/{o['limit']:,}" for o in over]))
                 if action in {"interrupt", "stop"}:
                     return {
                         "messages": [AIMessage("Stopped at your request.", additional_kwargs={"harness": "stopped"})],
                         "jump_to": "end",
+                        "audit": log + steer_audit(self.inbox, state),
                     }
                 if action == "caveat":
                     caveat = reply["text"]
@@ -668,6 +716,9 @@ class SteeringMiddleware(AgentMiddleware):
                     update["budget_limits"] = limits
 
         due = self.inbox.take(step, flush=paused)
+        log += steer_audit(self.inbox, state)  # this boundary's steers, plus any /stop or drop since the last one
+        if log:
+            update["audit"] = log
         if not due and not caveat:
             return update or None
         parts, ops = [], []
@@ -689,6 +740,7 @@ class SteeringMiddleware(AgentMiddleware):
         update["messages"] = [note("\n".join(parts))]
         if ops:
             update["ledger_ops"] = ops
+            update["audit"] = log + ledger_audit(ops)
         return update
 
 
@@ -757,8 +809,10 @@ class ToolGuardMiddleware(AgentMiddleware):
         _, confirmed = current_ledger(state.get("ledger_ops") or [])
         out: list[ToolMessage] = []
         review = []
+        step, log = steps_done(msgs), []
         for tc in ai.tool_calls:
             if self.require_ledger and not confirmed and tc["name"] not in LEDGER_EXEMPT:
+                log.append(audit_entry(step, "decision", "blocked", tool=tc["name"], why="ledger not confirmed"))
                 out.append(ToolMessage(
                     "Blocked: call write_ledger with your assumptions first. The user confirms it, "
                     "then you can run this call.", tool_call_id=tc["id"], name=tc["name"], status="error"))
@@ -767,11 +821,15 @@ class ToolGuardMiddleware(AgentMiddleware):
                                "reasons": why, "est_tokens": self.estimate(tc, msgs)})
         if review:
             reply = interrupt({"type": "approval", "calls": review})
-            if str(reply).strip().lower() not in {"", "y", "yes", "ok", "go", "approve", "1"}:
+            approved = str(reply).strip().lower() in {"", "y", "yes", "ok", "go", "approve", "1"}
+            log.append(audit_entry(step, "pause", "approval", answer="approved" if approved else str(reply),
+                                   calls=[f"{r['name']} ({'; '.join(r['reasons'])}, ~{r['est_tokens']:,} tokens)" for r in review]))
+            if not approved:
                 for r in review:
                     out.append(ToolMessage(f"The user declined this call: {reply!r}. Adjust and continue.",
                                            tool_call_id=r["id"], name=r["name"], status="error"))
-        return {"messages": out} if out else None
+        update = {"messages": out, "audit": log}
+        return {k: v for k, v in update.items() if v} or None
 
 
 # ---------------------------------------------------------------------------
@@ -797,6 +855,8 @@ class SelfReviewMiddleware(AgentMiddleware):
     once and dropping it would change the prompt prefix on the next call and
     cost a cache miss (T1); kept, it is about 100 tokens read from cache.
     """
+
+    state_schema = HarnessState
 
     def __init__(self, every: int = 4) -> None:
         super().__init__()
@@ -831,8 +891,32 @@ class SelfReviewMiddleware(AgentMiddleware):
 
     def before_model(self, state: dict[str, Any], runtime: Any) -> dict[str, Any] | None:
         if self.due(state["messages"]):
-            return {"messages": [note(SELF_REVIEW)]}
+            log = audit_entry(steps_done(state["messages"]) + 1, "decision", "self_review")  # sent with that step
+            return {"messages": [note(SELF_REVIEW)], "audit": [log]}
         return None
+
+
+class CacheUsageMiddleware(AgentMiddleware):
+    """T8: label cache writes with the lifetime that was asked for.
+
+    A streamed reply's usage carries the total cache-write count but not the
+    split into 5-minute and 1-hour writes, and 1-hour writes bill at 2x input
+    against 1.25x. When the split is missing, the writes came from this
+    harness's own breakpoints, so they are recorded at its TTL.
+    """
+
+    def __init__(self, ttl: str) -> None:
+        super().__init__()
+        self.key = f"ephemeral_{ttl}_input_tokens"
+
+    def wrap_model_call(self, request: Any, handler: Any) -> Any:
+        response = handler(request)
+        if isinstance(request.model, ChatAnthropic):
+            for m in getattr(response, "result", None) or []:
+                d = (getattr(m, "usage_metadata", None) or {}).get("input_token_details")
+                if d and d.get("cache_creation") and not (d.get("ephemeral_5m_input_tokens") or d.get("ephemeral_1h_input_tokens")):
+                    d[self.key], d["cache_creation"] = d["cache_creation"], 0
+        return response
 
 
 class ThinkingPinMiddleware(AgentMiddleware):
@@ -860,6 +944,9 @@ class ThinkingPinMiddleware(AgentMiddleware):
             if pins[name] is not None:
                 settings["thinking"] = pins[name]
             request = request.override(model_settings=settings)
+            log = audit_entry(steps_done(request.messages) + 1, "decision", "thinking_pinned",
+                              model=name, asked=json.dumps(now), kept=json.dumps(pins[name]))
+            return ExtendedModelResponse(model_response=handler(request), command=Command(update={"audit": [log]}))
         return handler(request)
 
 
@@ -921,7 +1008,7 @@ def build_agent(
     checkpointer: Any = None,
     guard: ToolGuardMiddleware | None = None,
     budget: Budget | None = None,
-    cache_ttl: Literal["5m", "1h"] = "1h",
+    cache_ttl: Literal["5m", "1h"] = "5m",
     middleware: Sequence[AgentMiddleware] = (),
 ):
     """`inbox.pause_every` turns on pause-every-N-steps mode (S13).
@@ -929,8 +1016,8 @@ def build_agent(
     `checkpointer` defaults to SQLite under .harness/. Pass InMemorySaver() for
     throwaway runs. `guard` sets the ledger rule and approval thresholds.
     `budget` sets run and step token budgets (T6). `cache_ttl` is the prompt
-    cache lifetime: 1 hour by default, since a supervised run can pause for you
-    longer than the 5-minute cache lasts (T2). `middleware` runs outermost.
+    cache lifetime (T2): 5 minutes by default. Use "1h" when you expect to pause
+    for longer than 5 minutes; its writes cost 2x input against 1.25x. `middleware` runs outermost.
     """
     model = resolve_model(model)
     inbox = inbox if inbox is not None else SteerInbox()
@@ -945,6 +1032,7 @@ def build_agent(
             guard or ToolGuardMiddleware(budget_tokens=budget.run if budget else None),
             SelfReviewMiddleware(review_every),
             ThinkingPinMiddleware(),
+            CacheUsageMiddleware(cache_ttl),
             # Same name as deepagents' own, so it replaces it in place: breakpoints after
             # the system prompt, after the tools, and on the latest message, with our TTL.
             AnthropicPromptCachingMiddleware(ttl=cache_ttl, unsupported_model_behavior="ignore"),
@@ -957,7 +1045,34 @@ def build_agent(
 # Terminal live view (S1, S9)
 # ---------------------------------------------------------------------------
 
-HINT = "   [type to steer · /follow · /collect · /ledger · /tokens · /stop · /pause N]"
+HINT = "   [type to steer · /follow · /collect · /ledger · /tokens · /audit · /stop · /pause N]"
+AUDIT_DIR = Path(__file__).parent / ".harness" / "audit"
+
+
+def audit_log(values: dict[str, Any], inbox: SteerInbox | None = None) -> list[dict[str, Any]]:
+    """A8: the run's audit log, plus steers the graph hasn't logged yet (a /stop or
+    a dropped message after the last step boundary)."""
+    log = list(values.get("audit") or [])
+    return log + (steer_audit(inbox, values) if inbox else [])
+
+
+def format_audit(log: list[dict[str, Any]]) -> list[str]:
+    rows = []
+    for e in log:
+        rest = " · ".join(f"{k}: {v if not isinstance(v, list) else '; '.join(map(str, v))}"
+                          for k, v in e.items() if k not in {"step", "kind", "what", "at", "uid"})
+        step = "-" if e.get("step") is None else e["step"]
+        rows.append(f"   step {step:>3}  {e['kind']:<8} {e['what']:<15} {rest}"[:220])
+    return rows or ["   (nothing logged yet)"]
+
+
+def export_audit(values: dict[str, Any], thread_id: str, inbox: SteerInbox | None = None,
+                 directory: Path = AUDIT_DIR) -> Path:
+    """Write the whole log to .harness/audit/<thread>.jsonl, one JSON object per line."""
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"{thread_id}.jsonl"
+    path.write_text("".join(json.dumps(e, default=str) + "\n" for e in audit_log(values, inbox)))
+    return path
 
 
 def _print_check_in(payload: dict[str, Any]) -> None:
@@ -1040,7 +1155,7 @@ def stream_run(agent: Any, payload: Any, config: dict[str, Any], inbox: SteerInb
             else:
                 _print_update(chunk, show_text=False)
     except StopRun:
-        inbox.take_interrupts(None)
+        inbox.take_interrupts(steps_done(agent.get_state(config).values.get("messages") or []) + 1)
         return "cancelled", None
     last = agent.get_state(config).values["messages"][-1]
     if last.additional_kwargs.get("harness") == "stopped":
@@ -1117,6 +1232,8 @@ def run_terminal(agent: Any, inbox: SteerInbox, thread_id: str | None = None) ->
             cmd, _, rest = line.strip().partition(" ")
             if cmd == "/tokens":  # works at any prompt, and while the agent runs
                 print("\n" + "\n".join(token_table(agent.get_state(config).values.get("messages") or [])))
+            elif cmd == "/audit":
+                print("\n" + "\n".join(format_audit(audit_log(agent.get_state(config).values, inbox))))
             elif waiting.is_set():
                 lines.put(line)
             elif cmd == "/pause":
@@ -1186,7 +1303,9 @@ def run_terminal(agent: Any, inbox: SteerInbox, thread_id: str | None = None) ->
             payload = {"messages": [HumanMessage(content=question)]}
         while True:  # one turn = possibly several pause/resume cycles
             outcome, pending = stream_run(agent, payload, config, inbox, view)
-            step = steps_done(agent.get_state(config).values["messages"])
+            values = agent.get_state(config).values
+            export_audit(values, thread_id, inbox)  # A8: the file is current at every pause and stop
+            step = steps_done(values["messages"])
             if outcome == "done":
                 turns.extend(inbox.after_turn(step))
                 payload = None
@@ -1211,13 +1330,17 @@ def run_terminal(agent: Any, inbox: SteerInbox, thread_id: str | None = None) ->
 if __name__ == "__main__":
     from dotenv import load_dotenv
 
-    from example_tools import TOOLS
-
     load_dotenv()  # picks up ANTHROPIC_API_KEY etc. from .env
+
+    if os.environ.get("HARNESS_TASK") == "drift":  # 8 countries x 4 months, planted NG anomaly
+        from drift_task import TOOLS
+    else:  # the short signups task with a missing month and a NULL column
+        from example_tools import TOOLS
 
     model = os.environ.get("AGENT_MODEL", "anthropic:claude-sonnet-5-5")
     env = {k: int(os.environ[k]) for k in ("PAUSE_EVERY", "RUN_BUDGET", "STEP_BUDGET") if os.environ.get(k)}
     box = SteerInbox(pause_every=env.get("PAUSE_EVERY"))
     budget = Budget(run=env.get("RUN_BUDGET"), step=env.get("STEP_BUDGET"))
     thread = sys.argv[sys.argv.index("--thread") + 1] if "--thread" in sys.argv else None
-    run_terminal(build_agent(model, TOOLS, box, review_every=4, budget=budget), box, thread_id=thread)
+    ttl = os.environ.get("CACHE_TTL", "5m")  # 1h if you expect to step away mid-run
+    run_terminal(build_agent(model, TOOLS, box, review_every=4, budget=budget, cache_ttl=ttl), box, thread_id=thread)
