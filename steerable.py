@@ -57,8 +57,11 @@ from __future__ import annotations
 import logging
 import operator
 import os
+import importlib.util
 import queue
+import shutil
 import sqlite3
+import subprocess
 import sys
 import threading
 import urllib.request
@@ -1056,16 +1059,18 @@ class ModelRouterMiddleware(AgentMiddleware):
 
     def __init__(self, cheap: Any = None, free: Sequence[Any] = (), routine_tools: Sequence[str] = (),
                  switch_at: float = 0.9, budget: Budget | None = None, check_tools: bool = True,
-                 tool_models: set[str] | None = None) -> None:
+                 tool_models: set[str] | None = None, cheap_key: str | None = None,
+                 free_key: str | None = None) -> None:
         super().__init__()
         self.budget = budget
         self.switch_at = switch_at
         self.routine_tools = set(routine_tools)
         self.dropped: list[str] = []
-        tiers = [resolve_model(m) for m in ([cheap] if cheap is not None else []) + list(free)]
+        cheap = resolve_model(cheap, cheap_key) if cheap is not None else None
+        tiers = ([cheap] if cheap is not None else []) + [resolve_model(m, free_key) for m in free]
         if check_tools:  # R6
             tiers = [m for m in tiers if self._supports_tools(m, tool_models)]
-        self.cheap = tiers[0] if cheap is not None and tiers and model_name(tiers[0]) == model_name(resolve_model(cheap)) else None
+        self.cheap = cheap if cheap is not None and tiers and tiers[0] is cheap else None
         self.chain: list[Any] = [None, *tiers]  # None = the agent's own model
 
     def _supports_tools(self, model: Any, known: set[str] | None) -> bool:
@@ -1191,32 +1196,74 @@ MODES_AVAILABLE = ("quick", "steer")
 ANTHROPIC_API = "https://api.anthropic.com"
 
 
-def resolve_model(model: Any) -> Any:
+def provider_package(provider: str) -> str | None:
+    """The pip package LangChain needs for `provider`, from LangChain's own provider table."""
+    from langchain.chat_models.base import _BUILTIN_PROVIDERS
+
+    if provider == "openrouter":  # this harness talks to OpenRouter through langchain-openai
+        provider = "openai"
+    entry = _BUILTIN_PROVIDERS.get(provider)
+    return entry[0].split(".")[0].replace("_", "-") if entry else None
+
+
+def ensure_provider(provider: str, run: Any = subprocess.run) -> None:
+    """Install the provider's LangChain package on first use, so a new model needs only its key.
+
+    Only package names from LangChain's provider table are installed, never a name
+    taken from the model string. HARNESS_AUTO_INSTALL=0 turns this off.
+    """
+    pkg = provider_package(provider)
+    if pkg is None or importlib.util.find_spec(pkg.replace("-", "_")) is not None:
+        return
+    if os.environ.get("HARNESS_AUTO_INSTALL") == "0":
+        raise ImportError(f"{provider} models need {pkg}: pip install {pkg} (auto-install is off)")
+    uv = shutil.which("uv")
+    cmd = [uv, "pip", "install", "--python", sys.executable, pkg] if uv else [sys.executable, "-m", "pip", "install", pkg]
+    print(f"   installing {pkg} for {provider} models (first use)")
+    run(cmd, check=True)
+    importlib.invalidate_caches()
+
+
+def api_key(key_name: str | None) -> dict[str, str]:
+    """`key_name` is the name of a .env variable holding the key, e.g. WORK_ANTHROPIC_KEY."""
+    if not key_name:
+        return {}
+    if not os.environ.get(key_name):
+        raise ValueError(f"{key_name} is not set; add it to .env")
+    return {"api_key": os.environ[key_name]}
+
+
+def resolve_model(model: Any, key_name: str | None = None) -> Any:
     """Turn a "provider:model" string into a chat model.
+
+    The key comes from the provider's usual variable (ANTHROPIC_API_KEY,
+    OPENAI_API_KEY, OPENROUTER_API_KEY, ...), or from the .env variable named by
+    `key_name`, so two tiers on one provider can use different keys. A provider
+    whose LangChain package isn't installed yet is installed on first use.
 
     Anthropic models always go to the real API. Other tools (the Claude desktop
     app, proxies) can set ANTHROPIC_BASE_URL in your shell, and the SDK would
     otherwise send your key there. To use a proxy on purpose, set
     HARNESS_ANTHROPIC_BASE_URL instead.
     """
-    if isinstance(model, str) and model.startswith("anthropic:"):
-        from langchain.chat_models import init_chat_model
+    if not isinstance(model, str):
+        return model
+    from langchain.chat_models import init_chat_model
 
+    key = api_key(key_name)
+    provider = model.split(":", 1)[0] if ":" in model else None
+    if provider:
+        ensure_provider(provider)
+    if provider == "anthropic":
         base_url = os.environ.get("HARNESS_ANTHROPIC_BASE_URL", ANTHROPIC_API)
-        return init_chat_model(model, base_url=base_url)
-    if isinstance(model, str) and model.startswith("openrouter:"):  # R1, R5: "openrouter:<model id>"
+        return init_chat_model(model, base_url=base_url, **key)
+    if provider == "openrouter":  # R1, R5: "openrouter:<model id>"
         from langchain_openai import ChatOpenAI
 
-        key = os.environ.get("OPENROUTER_API_KEY")
-        if not key:
-            raise ValueError(f"{model} needs OPENROUTER_API_KEY in .env")
+        key = key or api_key("OPENROUTER_API_KEY")
         # one retry at most: failed requests can still count against the free daily allowance (R10)
-        return ChatOpenAI(model=model.split(":", 1)[1], base_url=OPENROUTER_API, api_key=key, max_retries=1)
-    if isinstance(model, str):
-        from langchain.chat_models import init_chat_model
-
-        return init_chat_model(model)
-    return model
+        return ChatOpenAI(model=model.split(":", 1)[1], base_url=OPENROUTER_API, max_retries=1, **key)
+    return init_chat_model(model, **key)
 
 
 CHECKPOINTS = Path(__file__).parent / ".harness" / "checkpoints.sqlite"
@@ -1241,6 +1288,7 @@ def build_agent(
     middleware: Sequence[AgentMiddleware] = (),
     mode: Literal["steer", "quick"] = "steer",
     router: ModelRouterMiddleware | None = None,
+    model_key: str | None = None,
 ):
     """`mode="steer"` is the full harness: the ledger first, check-ins at gaps,
     self-review every `review_every` tool calls. Use it for long analysis that is
@@ -1257,8 +1305,9 @@ def build_agent(
     cache lifetime (T2): 5 minutes by default. Use "1h" when you expect to pause
     for longer than 5 minutes; its writes cost 2x input against 1.25x. `middleware` runs outermost.
     `router` adds the cheaper and free tiers (Phase 4); it switches on `budget` unless it has its own.
+    `model_key` names the .env variable with the key for `model`, if not the provider's usual one.
     """
-    model = resolve_model(model)
+    model = resolve_model(model, model_key)
     inbox = inbox if inbox is not None else SteerInbox()
     steer = mode == "steer"
     guard = guard or ToolGuardMiddleware(require_ledger=steer, budget_tokens=budget.run if budget else None)
@@ -1629,11 +1678,14 @@ if __name__ == "__main__":
 
     # Phase 4 tiers, e.g. CHEAP_MODEL=anthropic:claude-haiku-5-5
     # FREE_MODELS=openrouter:<id>:free,openrouter:<id>:free  ROUTINE=1 sends file-listing steps to CHEAP_MODEL
+    # *_KEY name the .env variable that holds a tier's key, when it isn't the provider's usual one
+    keys = {k: os.environ.get(f"{k}_KEY") or None for k in ("AGENT_MODEL", "CHEAP_MODEL", "FREE_MODELS")}
     cheap = os.environ.get("CHEAP_MODEL") or None
     free = [m.strip() for m in os.environ.get("FREE_MODELS", "").split(",") if m.strip()]
     routine = ROUTINE_TOOLS if os.environ.get("ROUTINE") == "1" else ()
     if cheap or free:
-        probe = ModelRouterMiddleware(cheap, free, routine_tools=routine)  # R6: check tool support once
+        probe = ModelRouterMiddleware(cheap, free, routine_tools=routine,  # R6: check tool support once
+                                      cheap_key=keys["CHEAP_MODEL"], free_key=keys["FREE_MODELS"])
         print("models: " + " → ".join([model, *probe.tiers()[1:]]))
         for d in probe.dropped:
             print(f"   dropped {d}")
@@ -1641,7 +1693,9 @@ if __name__ == "__main__":
         free = [m for m in free if m.split(":", 1)[1] in probe.tiers()]
 
     def make(m: str):
-        router = ModelRouterMiddleware(cheap, free, routine_tools=routine, check_tools=False) if cheap or free else None
-        return build_agent(model, TOOLS, box, review_every=4, budget=budget, cache_ttl=ttl, mode=m, router=router)
+        router = ModelRouterMiddleware(cheap, free, routine_tools=routine, check_tools=False, cheap_key=keys["CHEAP_MODEL"],
+                                       free_key=keys["FREE_MODELS"]) if cheap or free else None
+        return build_agent(model, TOOLS, box, review_every=4, budget=budget, cache_ttl=ttl, mode=m, router=router,
+                           model_key=keys["AGENT_MODEL"])
 
     run_terminal(make(mode), box, thread_id=thread, make_agent=make, mode=mode)

@@ -116,7 +116,7 @@ uv venv && uv pip install deepagents langchain-anthropic langgraph-checkpoint-sq
 ```
 
 ```bash
-python test_steerable.py && python test_ledger.py && python test_meter.py && python test_audit.py && python test_modes.py && python test_router.py
+python test_steerable.py && python test_ledger.py && python test_meter.py && python test_audit.py && python test_modes.py && python test_router.py && python test_keys.py
 ```
 
 ```bash
@@ -133,11 +133,23 @@ CACHE_TTL=1h python steerable.py
 
 `HARNESS_TASK=drift` loads the longer drift task instead (8 countries × 4 months, with a planted Nigeria October anomaly). Its data is identical to `../cc-compare/toydb.py`, the command-line version used for the Claude Code comparison.
 
-Any LangChain provider works through `AGENT_MODEL`. For OpenAI, put `OPENAI_API_KEY` in `.env` and install `langchain-openai`:
+### Models and keys
+
+Any LangChain provider works in any tier (`AGENT_MODEL`, `CHEAP_MODEL`, `FREE_MODELS`) as `provider:model`. Put the provider's key in `.env` under its usual name (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GOOGLE_API_KEY`, `OPENROUTER_API_KEY`, `GROQ_API_KEY`, ...). If the provider's LangChain package isn't installed, the harness installs it into this venv the first time you name the model, so a new provider needs only its key:
 
 ```bash
 AGENT_MODEL=openai:gpt-5-mini python live_test.py
 ```
+
+Only package names from LangChain's own provider table are installed. Set `HARNESS_AUTO_INSTALL=0` to get the `pip install` command instead.
+
+To use a key stored under a different name, for example two Anthropic accounts, give each tier the name of its `.env` variable with `AGENT_MODEL_KEY`, `CHEAP_MODEL_KEY` or `FREE_MODELS_KEY`:
+
+```bash
+AGENT_MODEL_KEY=WORK_ANTHROPIC_KEY CHEAP_MODEL=anthropic:claude-haiku-5-5 CHEAP_MODEL_KEY=PERSONAL_ANTHROPIC_KEY python steerable.py
+```
+
+These hold the variable's name, not the key, so keys stay in `.env` and never appear in a command or your shell history. In Python, the same options are `build_agent(model_key=...)` and `ModelRouterMiddleware(cheap_key=..., free_key=...)`.
 
 With a non-Anthropic model, the Anthropic cache breakpoints are skipped (OpenAI caches long prompts on its own), the meter still reads its cache-read tokens, and costs show as `?` until the model is added to `PRICES`.
 
@@ -192,6 +204,7 @@ The last run started from a cache an earlier run had left, so step 1 read 7,522 
 - Costs are only shown for models in `PRICES` (Sonnet 5.5 and Haiku 5.5) and `:free` models ($0). Other models show tokens without a cost. Haiku is priced at its up-to-100K-token rate; longer prompts cost 5x that.
 - The router has only been tested offline. No OpenRouter key has been used yet, so the free tier, its tool calling and its error messages are unverified on the real service.
 - Free models are weaker. The ledger, check-ins and the R8 approval matter more on them, and whether a given free model calls tools well needs a live run.
+- Auto-install covers models named as `provider:model`. A bare name such as `gpt-5-mini`, which LangChain guesses the provider for, isn't installed for you.
 - Subagents (`task`) run on the main model; the router doesn't route their calls.
 - Before sending real data to a free model, check its data policy (PRD open question). Some free providers log prompts.
 - With the default 5-minute cache, a pause longer than 5 minutes means the next call writes the whole prompt to the cache again. On the drift task the 1-hour cache cost about $0.020 more per run, so use it only for sessions where you'll step away.
