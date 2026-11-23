@@ -464,7 +464,17 @@ PRICES = {
     "claude-sonnet-5-5": {"input": 2.00, "cache_write_5m": 2.50, "cache_write_1h": 4.00, "cache_read": 0.10, "output": 10.00},
     "claude-haiku-5-5": {"input": 0.10, "cache_write_5m": 0.125, "cache_write_1h": 0.20, "cache_read": 0.01, "output": 0.50},
 }
-TOKEN_KEYS = ("input", "cache_read", "cache_write", "cache_write_1h", "output")
+TOKEN_KEYS = ("input", "cache_read", "cache_write", "cache_write_1h", "output", "web_searches")
+WEB_SEARCH_PRICE = 0.01  # $ per web search ($10 per 1,000); web fetch only costs the tokens it reads
+
+
+def server_calls(m: Any) -> Counter:
+    """Server tools (web search, web fetch) the API ran inside this reply. They never appear in
+    `tool_calls`: Anthropic runs them during the request and puts the results in the content."""
+    content = getattr(m, "content", None)
+    if not isinstance(content, list):
+        return Counter()
+    return Counter(b.get("name") for b in content if isinstance(b, dict) and b.get("type") == "server_tool_use")
 
 
 def usage(m: Any) -> dict[str, int]:
@@ -484,6 +494,7 @@ def usage(m: Any) -> dict[str, int]:
         "cache_write": w5m + w1h,
         "cache_write_1h": w1h,
         "output": u.get("output_tokens", 0),
+        "web_searches": server_calls(m)["web_search"],
     }
 
 
@@ -525,7 +536,8 @@ def cost(t: dict[str, int], model: str | None) -> float | None:
         return None
     w5m = t["cache_write"] - t["cache_write_1h"]
     return (t["input"] * p["input"] + t["cache_read"] * p["cache_read"] + w5m * p["cache_write_5m"]
-            + t["cache_write_1h"] * p["cache_write_1h"] + t["output"] * p["output"]) / 1e6
+            + t["cache_write_1h"] * p["cache_write_1h"] + t["output"] * p["output"]) / 1e6 \
+        + t.get("web_searches", 0) * WEB_SEARCH_PRICE
 
 
 def run_cost(messages: list[Any]) -> float | None:
@@ -557,6 +569,7 @@ def step_summary(state: dict[str, Any]) -> dict[str, Any]:
     ai = msgs[i]
     results = [m for m in msgs[i + 1:] if isinstance(m, ToolMessage)]
     calls = Counter(tc["name"] for tc in ai.tool_calls)
+    calls.update({f"{n} (on Anthropic's side)": c for n, c in server_calls(ai).items()})
     todos = state.get("todos") or []
     said = ai.text.strip().splitlines()[0][:140] if ai.text.strip() else ""
     run = msgs[turn_start(msgs):]
@@ -1010,6 +1023,71 @@ class ThinkingPinMiddleware(AgentMiddleware):
 OPENROUTER_API = "https://openrouter.ai/api/v1"
 ROUTINE_TOOLS = frozenset({"ls", "read_file", "glob", "grep", "write_todos"})
 
+# Anthropic server tools: the API runs them during the model call, so no code here executes them,
+# and the pre-tool approval (A5) can't see them. max_uses caps them per model call instead.
+# The basic versions are used on purpose: the newer ones start a code-execution container.
+WEB_TOOLS = (
+    {"type": "web_search_20250305", "name": "web_search", "max_uses": 5},
+    {"type": "web_fetch_20250910", "name": "web_fetch", "max_uses": 5, "max_content_tokens": 20000},
+)
+
+
+def without_server_tools(request: Any) -> Any:
+    """For a non-Anthropic tier: drop the web tools, and turn past web blocks into plain text."""
+    tools = [t for t in request.tools if not (isinstance(t, dict) and t.get("type", "").startswith(("web_search_", "web_fetch_")))]
+
+    def plain(m: Any) -> Any:
+        if not isinstance(m, AIMessage) or not isinstance(m.content, list):
+            return m
+        if not any(isinstance(b, dict) and b.get("type", "").startswith(("server_tool_use", "web_")) for b in m.content):
+            return m
+        text = []
+        for b in m.content:
+            if isinstance(b, str):
+                text.append(b)
+            elif b.get("type") == "text":
+                text.append(b.get("text", ""))
+            elif b.get("type") == "server_tool_use":
+                text.append(f"[{b.get('name')}: {b.get('input')}]")
+        return m.model_copy(update={"content": "\n".join(t for t in text if t)})
+
+    messages = [plain(m) for m in request.messages]
+    if len(tools) == len(request.tools) and all(a is b for a, b in zip(messages, request.messages)):
+        return request
+    return request.override(tools=tools, messages=messages)
+
+
+class PauseTurnMiddleware(AgentMiddleware):
+    """With server tools, a long search can end a reply with stop_reason "pause_turn" and no
+    tool calls, which would end the run. Send the paused reply back so the API carries on,
+    and return one reply that holds both parts."""
+
+    def __init__(self, max_resumes: int = 3) -> None:
+        super().__init__()
+        self.max_resumes = max_resumes
+
+    def wrap_model_call(self, request: Any, handler: Any) -> Any:
+        response = handler(request)
+        for _ in range(self.max_resumes):
+            ai = next((m for m in response.result if isinstance(m, AIMessage)), None)
+            if ai is None or ai.response_metadata.get("stop_reason") != "pause_turn":
+                break
+            more = handler(request.override(messages=[*request.messages, ai]))
+            nxt = next((m for m in more.result if isinstance(m, AIMessage)), None)
+            if nxt is None:
+                break
+            blocks = lambda x: x.content if isinstance(x.content, list) else [{"type": "text", "text": x.content}]
+            a, b = ai.usage_metadata or {}, nxt.usage_metadata or {}
+            ud = lambda k: {kk: (a.get(k) or {}).get(kk, 0) + (b.get(k) or {}).get(kk, 0)
+                            for kk in {*(a.get(k) or {}), *(b.get(k) or {})}}
+            merged = nxt.model_copy(update={
+                "content": [*blocks(ai), *blocks(nxt)],
+                "usage_metadata": {**b, **{k: a.get(k, 0) + b.get(k, 0) for k in ("input_tokens", "output_tokens", "total_tokens")},
+                                   "input_token_details": ud("input_token_details")},
+            })
+            response = ModelResponse(result=[merged if m is nxt else m for m in more.result])
+        return response
+
 
 def fallback_reason(e: BaseException) -> str | None:
     """R3: why an error should move the run down a tier, or None to raise it as is."""
@@ -1127,7 +1205,7 @@ class ModelRouterMiddleware(AgentMiddleware):
             if model is not None:
                 req = request.override(model=model)
                 if not isinstance(model, ChatAnthropic):
-                    req = _sanitize_request_for_fallback(req, model)  # R9
+                    req = without_server_tools(_sanitize_request_for_fallback(req, model))  # R9
             try:
                 response = handler(req)
                 break
@@ -1289,6 +1367,7 @@ def build_agent(
     mode: Literal["steer", "quick"] = "steer",
     router: ModelRouterMiddleware | None = None,
     model_key: str | None = None,
+    web: bool = False,
 ):
     """`mode="steer"` is the full harness: the ledger first, check-ins at gaps,
     self-review every `review_every` tool calls. Use it for long analysis that is
@@ -1315,7 +1394,7 @@ def build_agent(
         router.budget = budget
     return create_deep_agent(
         model=model,
-        tools=[check_in, write_ledger, update_ledger, *tools] if steer else list(tools),
+        tools=[*([check_in, write_ledger, update_ledger] if steer else []), *tools, *(WEB_TOOLS if web else ())],
         system_prompt=SYSTEM_PROMPT if steer else QUICK_PROMPT,
         middleware=[
             *middleware,
@@ -1324,6 +1403,7 @@ def build_agent(
             guard,
             *([SelfReviewMiddleware(review_every)] if steer else []),
             *([router] if router is not None else []),  # outside the caching layers, so they see the routed model
+            *([PauseTurnMiddleware()] if web else []),  # inside the router: a resumed call stays on one model
             ThinkingPinMiddleware(),
             CacheUsageMiddleware(cache_ttl),
             # Same name as deepagents' own, so it replaces it in place: breakpoints after
@@ -1400,6 +1480,9 @@ def _print_update(update: dict[str, Any], show_text: bool = True) -> None:
                 for tc in m.tool_calls:
                     if tc["name"] != "check_in":
                         print(f"  -> {tc['name']}({str(tc['args'])[:120]})")
+                for b in m.content if isinstance(m.content, list) else []:
+                    if isinstance(b, dict) and b.get("type") == "server_tool_use":
+                        print(f"  -> {b.get('name')}({str(b.get('input'))[:120]})  [ran on Anthropic's side]")
             elif isinstance(m, ToolMessage) and m.name != "check_in":
                 print(f"  <- {m.name}: {str(m.content)[:160]}")
 
@@ -1683,6 +1766,9 @@ if __name__ == "__main__":
     cheap = os.environ.get("CHEAP_MODEL") or None
     free = [m.strip() for m in os.environ.get("FREE_MODELS", "").split(",") if m.strip()]
     routine = ROUTINE_TOOLS if os.environ.get("ROUTINE") == "1" else ()
+    web = os.environ.get("WEB") == "1"  # Anthropic web search + fetch; queries go out to the web
+    if web:
+        print("web: on (search $0.01 each, up to 5 searches and 5 fetches per step; Claude models only)")
     if cheap or free:
         probe = ModelRouterMiddleware(cheap, free, routine_tools=routine,  # R6: check tool support once
                                       cheap_key=keys["CHEAP_MODEL"], free_key=keys["FREE_MODELS"])
@@ -1696,6 +1782,6 @@ if __name__ == "__main__":
         router = ModelRouterMiddleware(cheap, free, routine_tools=routine, check_tools=False, cheap_key=keys["CHEAP_MODEL"],
                                        free_key=keys["FREE_MODELS"]) if cheap or free else None
         return build_agent(model, TOOLS, box, review_every=4, budget=budget, cache_ttl=ttl, mode=m, router=router,
-                           model_key=keys["AGENT_MODEL"])
+                           model_key=keys["AGENT_MODEL"], web=web)
 
     run_terminal(make(mode), box, thread_id=thread, make_agent=make, mode=mode)

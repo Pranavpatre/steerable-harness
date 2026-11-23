@@ -53,7 +53,7 @@ agent = build(ScriptedModel(responses=steps), budget=Budget(run=5000))
 cfg = {"configurable": {"thread_id": "gate"}}
 events, p = run(agent, {"messages": [HumanMessage("trend?")]}, cfg)
 seen = panels(events)
-assert seen[2]["step_tokens"] == {"input": 200, "cache_read": 3000, "cache_write": 300, "cache_write_1h": 0, "output": 100}
+assert seen[2]["step_tokens"] == {"input": 200, "cache_read": 3000, "cache_write": 300, "cache_write_1h": 0, "output": 100, "web_searches": 0}
 meter = "\n".join(format_summary(seen[2]))
 assert "cache read 3,000" in meter and "4,700 tokens of 5,000 budget (94%)" in meter, meter
 assert "$" in meter, "priced from the model name in the API response"

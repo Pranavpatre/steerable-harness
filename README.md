@@ -109,6 +109,20 @@ The PRD suggests LangChain's `ModelFallbackMiddleware` for hard failures. The ro
 
 Haiku 5.5 costs $0.10 / $0.50 per million input / output tokens up to 100K-token prompts, against Sonnet 5.5's $2 / $10. A routine step on Haiku has no cache yet, so it pays Haiku's cache-write rate on the whole prompt the first time, but its output is 20x cheaper. Whether routine routing saves money on a given task needs a live run.
 
+## Web search and fetch
+
+`WEB=1 python steerable.py` (or `build_agent(..., web=True)`) gives the agent Anthropic's own web search and web fetch tools. Anthropic runs them during the model call, so there is nothing to install and no extra key. Off by default, because the agent's search queries go out to the web.
+
+| Piece | What happens |
+|---|---|
+| Limits | Up to 5 searches and 5 page fetches per model call (`max_uses`), and a fetched page is cut at 20,000 tokens. The basic tool versions are used, because the newer ones also start a code-execution container. |
+| Cost | A search costs $0.01 on top of its tokens; a fetch costs only the tokens of the page it reads. The meter adds the search fee to each step's cost. On a live check, one search pulled in about 17,000 tokens, so that step cost $0.060. |
+| Live view | Each search or fetch prints as `-> web_search({...})  [ran on Anthropic's side]`, and the step panel lists it under `did:`. |
+| Long searches | If the API pauses a long search (`stop_reason: "pause_turn"`), the harness sends the paused reply back so it carries on, and returns both parts as one step, up to 3 times. |
+| Other models | Claude models only. When the router moves to an OpenAI or OpenRouter tier, the web tools are dropped and past searches are passed on as plain text. |
+
+The web tools don't go through the pre-tool approval (A5) or the ledger gate, because they run inside the model call where the harness can't stop them. `max_uses` caps them instead. Keep company or private data out of a run with web on: the model writes the search queries, and a query can include whatever is in the conversation.
+
 ## Run it
 
 ```bash
@@ -116,7 +130,7 @@ uv venv && uv pip install deepagents langchain-anthropic langgraph-checkpoint-sq
 ```
 
 ```bash
-python test_steerable.py && python test_ledger.py && python test_meter.py && python test_audit.py && python test_modes.py && python test_router.py && python test_keys.py
+python test_steerable.py && python test_ledger.py && python test_meter.py && python test_audit.py && python test_modes.py && python test_router.py && python test_keys.py && python test_web.py
 ```
 
 ```bash
