@@ -165,17 +165,35 @@ The tests run offline with a scripted model and cost no tokens. They include all
 6. **UI loop.** Read input on a background thread. While the agent runs, each line is a steering note. During a check-in, the next line is your answer.
 7. **Later.** Add `interrupt_on={"execute": True}` for tool approvals, which uses the same resume loop. Move the runner to a web UI or Slack by replacing `run_terminal`.
 
-## Benchmark results (Claude Sonnet 5.5, 3 runs per mode, 2026-11-18)
+## Benchmark results (Claude Sonnet 5.5, 3 runs per mode, median, 2026-11-23)
 
-`benchmark.py long 3`: "activation by country" with 3 possible definitions and no default. Measured before Phases 2 and 3. The ledger checkpoint and the saved self-review prompt change the steerable mode, so these numbers need a rerun. The benchmark keeps the 5-minute cache for every mode, so the comparison stays like for like.
+Rerun with Phases 2 to 4. Every mode uses the 5-minute cache, so the comparison stays like for like. Costs come from the harness's own token parser. The printed token split in these two runs shows 0 cache writes (with the writes counted as uncached input) because of a parsing bug, since fixed; the costs are unaffected. Raw output: `.harness/bench_long_2026_11_23.txt` and `.harness/bench_midrun_2026_11_23.txt`.
+
+**`benchmark.py long 3`: the ambiguity is visible up front.** "Activation by country" with 3 possible definitions and no default. All modes got the right answer 3/3.
 
 | Mode | Tool calls | Cost per task | vs baseline |
 |---|---|---|---|
-| baseline (answer, then correct) | 98 | $0.223 | — |
-| ask_text (plain agent told to ask first) | 34 | $0.083 | −63% |
-| steerable (this harness) | 36 | $0.090 | −60% |
+| baseline (answer, then correct) | 98 | $0.239 | — |
+| ask_text (plain agent told to ask first) | 34 | $0.089 | −63% |
+| steer (ledger, check-ins) | 36 | $0.093 | −61% |
+| steer + router (routine steps to Haiku) | 36 | $0.095 | −60% |
+| quick | 98 | $0.254 | +7% |
 
-The saving comes from asking before doing the work: the plain agent ran the analysis for all 3 definitions. A plain agent with an "ask first" prompt saved just as much. `benchmark.py toy 3` (short task, obvious gaps) showed the harness costing about 2× a plain agent.
+Steer mode's saving comes from the ledger: the definition got fixed there, once, in every run. A plain agent told to ask first saves as much, because here the question is visible at the start. Quick mode behaves like a plain agent. No step used only routine tools, so the router never routed.
+
+**`benchmark.py midrun 3`: the gap only shows up mid-run.** India's Sep and Oct jump about 1.8x and look like real growth; only the user knows it is a one-off import (`mid_run_task.py`). The simulated user has nothing to say up front, steers as soon as India's Sep or Oct result appears, and corrects any wrong final answer.
+
+| Mode | Right first time | User turns | Cost per task | vs baseline |
+|---|---|---|---|---|
+| baseline | 0/3 | 2 | $0.061 | — |
+| ask_text | 0/3 | 3 | $0.072 | +18% |
+| steer | 3/3 | 1 | $0.060 | −2% |
+| steer + router | 3/3 | 1 | $0.057 | −7% |
+| quick (live steering only) | 3/3 | 1 | $0.055 | −10% |
+
+Asking first can't catch this gap, so ask_text pays for an extra turn and is still wrong. Every harness mode was right first time because the steer landed at step 2 or 3, before the answer. The dollar saving is small here: the agents ran all 18 queries in parallel and the data stayed in context, so a correction after the answer only cost one more answer. The saving grows when a correction forces the work to be redone. The router again never routed, so its gap to steer is noise.
+
+`benchmark.py toy 3` (short task, obvious gaps) was not rerun; on 2026-11-18 the harness cost about 2x a plain agent there.
 
 ## Live comparison with Claude Code (drift task, Sonnet 5.5, 2026-11-18)
 
