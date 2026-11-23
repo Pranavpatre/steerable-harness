@@ -54,6 +54,7 @@ middleware on top of Deep Agents, built on LangGraph checkpointers + threads.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import operator
 import os
@@ -985,6 +986,81 @@ class CacheUsageMiddleware(AgentMiddleware):
         return response
 
 
+class KeepWarm:
+    """Keeps the prompt cache alive while a run waits for you at a pause.
+
+    The cache lasts 5 minutes from its last use. A pause longer than that makes the next
+    step write the whole prompt to the cache again, at 12.5x the price of reading it. While
+    you are away this replays the last request every `ttl - 60` seconds with max_tokens=1:
+    the cached prompt is read at 0.1x input (about $0.01 for an 85K-token prompt) and the
+    clock restarts. It stops when you answer, after `max_pings`, or on any error, and says
+    what it spent. It does nothing for models that aren't Anthropic's."""
+
+    def __init__(self, ttl: str = "5m", max_pings: int = 6, interval: float | None = None) -> None:
+        self.interval = interval or ((300 if ttl == "5m" else 3600) - 60)
+        self.max_pings = max_pings
+        self.last: tuple[Any, Any] | None = None  # the last real request, and the handler below this layer
+        self.pings, self.spent, self.error = 0, 0.0, None
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def remember(self, request: Any, handler: Any) -> None:
+        self.last = (request, handler) if isinstance(request.model, ChatAnthropic) else None
+
+    def ping(self) -> None:
+        request, handler = self.last
+        response = handler(request.override(model_settings={**request.model_settings, "max_tokens": 1}))
+        for m in response.result:
+            if isinstance(m, AIMessage):
+                self.spent += cost(usage(m), model_of(m)) or 0.0
+        self.pings += 1
+
+    def start(self) -> None:
+        if self.last is None or self.max_pings < 1:
+            return
+        self.pings, self.spent, self.error = 0, 0.0, None
+        self._stop.clear()
+
+        def loop() -> None:
+            while not self._stop.wait(self.interval):
+                if self.pings >= self.max_pings:
+                    return
+                try:
+                    self.ping()
+                except Exception as e:  # noqa: BLE001 - a failed keep-alive must never break the run
+                    self.error = f"{type(e).__name__}: {e}"[:200]
+                    return
+
+        self._thread = threading.Thread(target=loop, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> str | None:
+        """End the keep-alive. Returns one line to show the user, or None if it did nothing."""
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=30)  # a refresh already in flight finishes first
+            self._thread = None
+        if self.error:
+            return f"cache keep-alive stopped ({self.error}); the next step may rewrite the cache"
+        if self.pings:
+            return (f"kept the cache warm while you were away: {self.pings} refresh"
+                    f"{'es' if self.pings > 1 else ''}, about ${self.spent:.3f} (not in the meter)")
+        return None
+
+
+class KeepWarmMiddleware(AgentMiddleware):
+    """Hands KeepWarm each real request. Sits just inside ThinkingPin and outside the cache
+    markers, so a replay gets the same cache settings and has no side effects on the run."""
+
+    def __init__(self, warm: KeepWarm) -> None:
+        super().__init__()
+        self.warm = warm
+
+    def wrap_model_call(self, request: Any, handler: Any) -> Any:
+        self.warm.remember(request, handler)
+        return handler(request)
+
+
 class ThinkingPinMiddleware(AgentMiddleware):
     """T4: thinking settings never change mid-run.
 
@@ -1368,6 +1444,7 @@ def build_agent(
     router: ModelRouterMiddleware | None = None,
     model_key: str | None = None,
     web: bool = False,
+    keep_warm: int = 6,
 ):
     """`mode="steer"` is the full harness: the ledger first, check-ins at gaps,
     self-review every `review_every` tool calls. Use it for long analysis that is
@@ -1392,6 +1469,8 @@ def build_agent(
     guard = guard or ToolGuardMiddleware(require_ledger=steer, budget_tokens=budget.run if budget else None)
     if router is not None and router.budget is None:
         router.budget = budget
+    warm = KeepWarm(cache_ttl, max_pings=keep_warm)  # refreshes the cache while a pause waits for you
+    inbox.warm = warm
     return create_deep_agent(
         model=model,
         tools=[*([check_in, write_ledger, update_ledger] if steer else []), *tools, *(WEB_TOOLS if web else ())],
@@ -1405,6 +1484,7 @@ def build_agent(
             *([router] if router is not None else []),  # outside the caching layers, so they see the routed model
             *([PauseTurnMiddleware()] if web else []),  # inside the router: a resumed call stays on one model
             ThinkingPinMiddleware(),
+            KeepWarmMiddleware(warm),
             CacheUsageMiddleware(cache_ttl),
             # Same name as deepagents' own, so it replaces it in place: breakpoints after
             # the system prompt, after the tools, and on the latest message, with our TTL.
@@ -1640,7 +1720,23 @@ def run_terminal(agent: Any, inbox: SteerInbox, thread_id: str | None = None,
         waiting.clear()
         return answer
 
+    @contextlib.contextmanager
+    def warm_cache():
+        """While a run waits for you, keep its prompt cache alive (KeepWarm)."""
+        warm = getattr(inbox, "warm", None)
+        if warm:
+            warm.start()
+        try:
+            yield
+        finally:
+            if warm and (note_ := warm.stop()):
+                print(f"\n   {note_}")
+
     def answer(pending: dict[str, Any], step: int) -> Command:
+        with warm_cache():
+            return answer_pause(pending, step)
+
+    def answer_pause(pending: dict[str, Any], step: int) -> Command:
         """Show a pause and turn the user's reply into the resume value."""
         kind = pending.get("type")
         if kind == "step_pause":
@@ -1725,7 +1821,8 @@ def run_terminal(agent: Any, inbox: SteerInbox, thread_id: str | None = None,
                 break
             if outcome in {"cancelled", "stopped"}:
                 print(f"\n■ Stopped after step {step}. The last checkpoint is kept.")
-                reply = ask("  [Enter] resume · type an edit to resume with it · /new to drop it\n> ")
+                with warm_cache():
+                    reply = ask("  [Enter] resume · type an edit to resume with it · /new to drop it\n> ")
                 if reply.strip() == "/new":
                     inbox.drop_pending()
                     payload = None
@@ -1782,6 +1879,7 @@ if __name__ == "__main__":
         router = ModelRouterMiddleware(cheap, free, routine_tools=routine, check_tools=False, cheap_key=keys["CHEAP_MODEL"],
                                        free_key=keys["FREE_MODELS"]) if cheap or free else None
         return build_agent(model, TOOLS, box, review_every=4, budget=budget, cache_ttl=ttl, mode=m, router=router,
-                           model_key=keys["AGENT_MODEL"], web=web)
+                           model_key=keys["AGENT_MODEL"], web=web,
+                           keep_warm=int(os.environ.get("KEEPALIVE_MAX", 6)))
 
     run_terminal(make(mode), box, thread_id=thread, make_agent=make, mode=mode)

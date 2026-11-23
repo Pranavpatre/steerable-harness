@@ -71,9 +71,10 @@ The log lives in run state, so it is checkpointed with the run and survives a re
 | Piece | PRD | What happens |
 |---|---|---|
 | Append-only history | T1 | Steers, caveats, ledger edits and the self-review prompt are all appended at the end and saved. Every request starts with the previous request, byte for byte, so repeated input is billed at the cache-read rate. |
-| Cache lifetime | T2 | Breakpoints after the system prompt, after the tool definitions, and on the latest message. The default lifetime is 5 minutes, since most pauses are shorter. If you expect to step away mid-run, `CACHE_TTL=1h` in the terminal (or `build_agent(cache_ttl="1h")`) keeps the cache for an hour, at 2x input per write instead of 1.25x. This replaces deepagents' own caching middleware. When a streamed reply doesn't split cache writes by lifetime, the meter records them at the lifetime the harness asked for. |
+| Cache lifetime | T2 | Breakpoints after the system prompt, after the tool definitions, and on the latest message. The default lifetime is 5 minutes, since most pauses are shorter. If you expect to step away mid-run, `CACHE_TTL=1h` in the terminal (or `build_agent(cache_ttl="1h")`) keeps the cache for an hour, at 2x input per write instead of 1.25x. This replaces deepagents' own caching middleware. While a run waits for you at a pause, the harness keeps the 5-minute cache alive (see below). When a streamed reply doesn't split cache writes by lifetime, the meter records them at the lifetime the harness asked for. |
 | Thinking pinned | T4 | The first call to each model in a thread fixes its thinking settings. If anything asks for different ones mid-run, the original settings are put back and the live view says so. |
 | Budgets | T6 | `Budget(run=..., step=...)`, or `RUN_BUDGET` / `STEP_BUDGET` in the terminal. The step panel warns once the run crosses 80%, or when a step uses 80% of the step budget. At 100% the run pauses at the next step boundary: [1] Continue (adds one more run budget), [2] Set a new budget, [3] Stop, or type a note to continue with. A new question starts a fresh run budget. |
+| Keep-warm | T2 | The cache lasts 5 minutes from its last use, and pauses (a budget stop, a check-in, an approval) can run longer. A real run paused 6.5 minutes at a budget stop, and the next step re-wrote 56,944 tokens instead of reading them: about $0.14, or 19% of the run. While the terminal waits for your answer at a pause, `KeepWarm` replays the last request every 4 minutes with `max_tokens=1`. That reads the cached prompt at 0.1x input (about $0.01 for an 85K-token prompt) and restarts the clock. It stops when you answer, after 6 refreshes (`KEEPALIVE_MAX=6`, `0` turns it off), or on any error, and prints what it spent. Those refreshes aren't in the meter. With `CACHE_TTL=1h` it refreshes every 59 minutes instead. It only runs at a pause, not at the idle `you>` prompt, and only for Claude models. In code: `build_agent(..., keep_warm=6)`, then `inbox.warm.start()` and `inbox.warm.stop()` around your own pause UI. |
 | Meter | T8 | Every step panel shows that call's input, cache read, cache write and output tokens from the usage fields the API returns, the run total against its budget, and the cost. `/tokens` prints the table for the whole thread, at any prompt. |
 
 Budgets count every token except cache reads, which bill at 1/20 of the input price. Cache reads are shown next to the total instead.
@@ -130,7 +131,7 @@ uv venv && uv pip install deepagents langchain-anthropic langgraph-checkpoint-sq
 ```
 
 ```bash
-python test_steerable.py && python test_ledger.py && python test_meter.py && python test_audit.py && python test_modes.py && python test_router.py && python test_keys.py && python test_web.py
+python test_steerable.py && python test_ledger.py && python test_meter.py && python test_audit.py && python test_modes.py && python test_router.py && python test_keys.py && python test_web.py && python test_keepwarm.py
 ```
 
 ```bash
@@ -239,7 +240,7 @@ The last run started from a cache an earlier run had left, so step 1 read 7,522 
 - Auto-install covers models named as `provider:model`. A bare name such as `gpt-5-mini`, which LangChain guesses the provider for, isn't installed for you.
 - Subagents (`task`) run on the main model; the router doesn't route their calls.
 - Before sending real data to a free model, check its data policy (PRD open question). Some free providers log prompts.
-- With the default 5-minute cache, a pause longer than 5 minutes means the next call writes the whole prompt to the cache again. On the drift task the 1-hour cache cost about $0.020 more per run, so use it only for sessions where you'll step away.
+- The keep-warm covers pauses up to about 24 minutes (6 refreshes). A longer pause, or a `/stop` left sitting past that, still re-writes the prompt on the next call. If you answer while a refresh is in flight, the run waits a few seconds for it to finish. On the drift task the 1-hour cache cost about $0.020 more per run, so use it only for sessions where you'll step away for longer than the keep-warm covers.
 - The cache tests check the request bytes, not real cache hits. Hit rates need a live run.
 - `benchmark.py` and `live_test.py` use in-memory checkpoints because they reuse thread IDs.
 - Anthropic models always call `https://api.anthropic.com`, even if your shell has `ANTHROPIC_BASE_URL` set (the Claude desktop app sets one). To use a proxy on purpose, set `HARNESS_ANTHROPIC_BASE_URL`.
