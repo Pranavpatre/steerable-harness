@@ -1,5 +1,18 @@
 # Steerable harness (on deepagents)
 
+A personal project: an agent harness that lets you watch a long run as it happens, correct it mid-run, and see the cost of every step.
+
+## Quick start
+
+```bash
+git clone https://github.com/Pranavpatre/steerable-harness.git && cd steerable-harness
+python3 -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt
+cp .env.example .env   # then add your ANTHROPIC_API_KEY
+python steerable.py
+```
+
+The tests run offline with a scripted model and cost no tokens (see "Run it" below). Everything runs on synthetic data.
+
 ## The problem
 
 A standard agent turn runs blind from question to answer. If it finds a gap halfway through, such as a missing month or a NULL column, it assumes something and keeps going. You only see the assumption at the end, after paying for all the tokens built on top of it.
@@ -146,7 +159,7 @@ RUN_BUDGET=50000 STEP_BUDGET=15000 python steerable.py
 CACHE_TTL=1h python steerable.py
 ```
 
-`HARNESS_TASK=drift` loads the longer drift task instead (8 countries × 4 months, with a planted Nigeria October anomaly). Its data is identical to `../cc-compare/toydb.py`, the command-line version used for the Claude Code comparison.
+`HARNESS_TASK=drift` loads the longer drift task instead (8 countries × 4 months, with a planted Nigeria October anomaly).
 
 ### Models and keys
 

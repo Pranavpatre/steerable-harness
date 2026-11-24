@@ -1,0 +1,6 @@
+deepagents>=0.7.39
+langchain-anthropic>=1.7
+langchain-openai>=1.8
+langgraph-checkpoint-sqlite>=3.1
+python-dotenv>=1.2
+# langchain-openai also serves OpenRouter. Other providers install themselves the first time you name their model.
